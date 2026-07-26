@@ -13,6 +13,8 @@ Use the current Spine source code and tests as the only API authority. In partic
 - Treat Kafka and RabbitMQ delivery as at least once: make consumers idempotent, and use an outbox when a database commit and an external publish must behave as one durable operation.
 - Keep broker transports secure by default. Kafka requires TLS unless a custom transport is supplied, and RabbitMQ requires `amqps://`; insecure compatibility flags are for isolated local development only.
 - Scope global interceptors with `InterceptorFor(boot.InterceptorHTTP|boot.InterceptorWebSocket|boot.InterceptorAll, ...)` when a policy does not apply to both HTTP and WebSocket traffic.
+- Implement all four `core.Interceptor` methods: `PreHandle`, `PostHandle`, `BeforeResponse`, and `AfterCompletion`. `BeforeResponse` is required even when an interceptor has no pre-response work.
+- Reusing the same interceptor pointer across scopes merges those scopes and executes that instance once; distinct instances of the same type execute independently.
 
 The examples require Go `1.25.5` or later and the module:
 
@@ -78,7 +80,7 @@ go run .
 curl http://localhost:8080/health/42
 ```
 
-The `path.Int` parameter is resolved from `:id`; access the parsed value through `id.Value`. Calling `Validate` separately is useful in CI and deployment checks; it does not open a network connection. `Run` repeats that validation and does not open the HTTP listener until dependency warm-up and enabled broker readiness checks succeed.
+The `path.Int` parameter is resolved from `:id`; access the parsed value through `id.Value`. Calling `Validate` separately is useful in CI and deployment checks; it does not open a network connection. `Run` repeats that validation and does not open the HTTP listener until dependency warm-up and enabled broker readiness checks succeed. When validation returns `*boot.ConfigError`, inspect `Issues`; treat each issue's `Code` as the stable machine-readable value instead of parsing the human-readable error message.
 
 ## 2. CRUD + DI + error handling
 
@@ -222,6 +224,8 @@ Expected failure responses are returned through `httperr.BadRequest` and `httper
 
 DI constructors and their returned providers must be non-nil. A provider resolved through its concrete type and through an implemented interface shares one singleton. A successful HTTP response is serialized and its cookies and status are validated before `BeforeResponse` runs, so a transaction interceptor can roll back on response-preparation failures. A physical socket write still cannot be atomic with a database commit.
 
+HTTP timeouts, header size, and body size have bounded defaults when their option is zero. Set `HTTPOptions.MaxBodyBytes` to a negative value only when deliberately disabling the request-body limit. For browser APIs, prefer `cors.NewValidated`; credentials cannot be combined with the wildcard origin `*`. Spine rejects invalid response cookies before committing the response, so encode arbitrary Unicode or delimiter-containing cookie values with `httpx.EncodeCookieValue` and decode them with `httpx.DecodeCookieValue`.
+
 ## 3. WebSocket chat
 
 This application receives a JSON message on `/ws/chat` and broadcasts it to every connected client. Create `main.go`:
@@ -343,9 +347,14 @@ Run two WebSocket clients against `ws://localhost:8080/ws/chat`, then send:
 
 Each connected client receives a JSON `ChatEvent`. `ws.ConnectionID` identifies the sender, and `ws.Sender` is obtained from the request context using `ws.SenderKey`.
 
-An empty `AllowedOrigins` uses same-origin checks; production browser clients should normally use exact origins. The default connection limit is `boot.DefaultWebSocketMaxConnections` (1024), and capacity rejection returns HTTP 503 with the `WEBSOCKET_CAPACITY_EXCEEDED` code. For authentication before upgrade, register an interceptor for `boot.InterceptorWebSocket` and additionally implement:
+An empty `AllowedOrigins` uses scheme-and-host same-origin checks; production browser clients should normally use exact origins. When `TrustedProxyCIDRs` is configured, the trusted reverse proxy must remove or overwrite client-supplied forwarding headers. The default active-and-pending connection limit is `boot.DefaultWebSocketMaxConnections` (1024); use a positive value or `boot.UnlimitedWebSocketConnections` explicitly. Capacity rejection returns HTTP 503 with `Retry-After` and the `WEBSOCKET_CAPACITY_EXCEEDED` code. Zero message-size and timeout options use bounded defaults.
+
+For authentication before upgrade, use an interceptor that implements both `core.Interceptor` and the optional `core.WebSocketHandshakeInterceptor`, then register the same instance for WebSocket traffic:
 
 ```go
+auth := &AuthInterceptor{}
+app.InterceptorFor(boot.InterceptorWebSocket, auth)
+
 func (i *AuthInterceptor) PreHandshake(
 	ctx core.WebSocketHandshakeContext,
 	meta core.HandlerMeta,
@@ -358,7 +367,7 @@ func (i *AuthInterceptor) PreHandshake(
 }
 ```
 
-`PreHandshake` runs before the HTTP upgrade. Message-level `PreHandle` keeps running once per message. `core.WebSocketMessageContext` also exposes an immutable snapshot of handshake headers, query values, cookies, remote address, host, and request URI.
+The connection slot is reserved before `PreHandshake`, and `PreHandshake` runs before the HTTP upgrade; rejected handshakes release their slot. Message-level `PreHandle` keeps running once per message. Inside a message interceptor, type-assert its `core.ExecutionContext` to `core.WebSocketMessageContext` to read the immutable handshake headers, query values, cookies, remote address, host, and request URI. These request-view interfaces are not additional controller-handler parameters.
 
 ## 4. Kafka event publishing and consumption
 
@@ -508,3 +517,5 @@ curl -i -X POST http://localhost:8080/orders/123
 `publish.Event` queues events on the request context. Spine dispatches them only after the controller succeeds and the HTTP response passes serialization, cookie, and status validation, using the configured Kafka publisher. The consumer handler receives `context.Context`, the event name, and the DTO decoded from the Kafka message.
 
 Framework-managed Kafka writes require acknowledgements from all in-sync replicas. Consumption is still at least once: handlers must be idempotent, and a permanently failing record can block its partition because Spine does not automatically skip it or choose a dead-letter policy. Reader creation and reconstruction after failed ACK/NACK use `KafkaOptions.ConsumerRetry`; shutdown waits for active handlers, ACK/NACK work, and readers to drain.
+
+Configure `KafkaOptions.Write` in every application that calls `publish.Event`; without an enabled publisher, queued domain events have no external destination. A consumer-only application handles `SIGINT` and `SIGTERM` even without HTTP. For an HTTP application, enable `EnableGracefulShutdown` and set a positive `ShutdownTimeout` when signal-driven graceful shutdown is required.
