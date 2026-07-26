@@ -90,3 +90,34 @@ type WebSocketContext interface {
 	MessageType() int
 	Payload() []byte
 }
+
+/*
+WebSocketRequestContext
+- WebSocket upgrade 요청에서 보존한 불변 요청 정보 뷰
+- WebSocketContext와 별도인 추가 계약이므로 기존 사용자 구현을 깨지 않습니다.
+*/
+type WebSocketRequestContext interface {
+	ContextCarrier
+
+	Path() string
+	Header(name string) string
+	Headers() map[string][]string
+	Query(name string) string
+	Queries() map[string][]string
+	Cookie(name string) (string, bool)
+	Cookies() map[string]string
+	RemoteAddr() string
+	Host() string
+	RequestURI() string
+}
+
+// WebSocketHandshakeContext는 HTTP upgrade 전에 인증/인가에 사용할 요청 뷰입니다.
+type WebSocketHandshakeContext interface {
+	WebSocketRequestContext
+}
+
+// WebSocketMessageContext는 메시지 처리와 원래 handshake 요청 정보를 함께 제공합니다.
+type WebSocketMessageContext interface {
+	WebSocketContext
+	WebSocketRequestContext
+}

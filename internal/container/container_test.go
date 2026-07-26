@@ -54,6 +54,14 @@ type cycleBarrierB struct{}
 
 func TestRegisterConstructor_Validation(t *testing.T) {
 	c := New()
+	if err := c.RegisterConstructor(nil); err == nil || !strings.Contains(err.Error(), "must not be nil") {
+		t.Fatalf("nil constructor는 명시적 설정 오류여야 합니다: %v", err)
+	}
+
+	var nilConstructor func() *testRepo
+	if err := c.RegisterConstructor(nilConstructor); err == nil || !strings.Contains(err.Error(), "must not be nil") {
+		t.Fatalf("typed-nil constructor는 명시적 설정 오류여야 합니다: %v", err)
+	}
 
 	if err := c.RegisterConstructor(123); err == nil {
 		t.Fatal("함수가 아닌 생성자에 대해 에러가 발생해야 합니다")
@@ -61,6 +69,43 @@ func TestRegisterConstructor_Validation(t *testing.T) {
 
 	if err := c.RegisterConstructor(func() (*testRepo, *testService) { return nil, nil }); err == nil {
 		t.Fatal("반환값이 여러 개인 생성자에 대해 에러가 발생해야 합니다")
+	}
+}
+
+func TestResolve_TypedNilConstructorResultReturnsError(t *testing.T) {
+	c := New()
+	if err := c.RegisterConstructor(func() *testRepo { return nil }); err != nil {
+		t.Fatalf("생성자 등록 실패: %v", err)
+	}
+
+	instance, err := c.Resolve(reflect.TypeOf(&testRepo{}))
+	if err == nil || !strings.Contains(err.Error(), "returned nil") {
+		t.Fatalf("typed-nil 결과는 명시적 Resolve 오류여야 합니다: instance=%v err=%v", instance, err)
+	}
+}
+
+func TestResolve_AllowsNilCollectionConstructorResults(t *testing.T) {
+	type collectionConsumer struct {
+		values []string
+	}
+
+	c := New()
+	if err := c.RegisterConstructor(func() []string { return nil }); err != nil {
+		t.Fatalf("nil slice 생성자 등록 실패: %v", err)
+	}
+	if err := c.RegisterConstructor(func(values []string) *collectionConsumer {
+		return &collectionConsumer{values: values}
+	}); err != nil {
+		t.Fatalf("collection consumer 등록 실패: %v", err)
+	}
+
+	resolved, err := c.Resolve(reflect.TypeFor[*collectionConsumer]())
+	if err != nil {
+		t.Fatalf("nil collection provider를 의존성으로 사용할 수 있어야 합니다: %v", err)
+	}
+	consumer := resolved.(*collectionConsumer)
+	if consumer.values != nil {
+		t.Fatalf("nil slice 값이 보존되어야 합니다: %#v", consumer.values)
 	}
 }
 
@@ -117,6 +162,84 @@ func TestResolve_InterfaceAssignableConstructor(t *testing.T) {
 	}
 	if iface.Name() != "impl" {
 		t.Fatalf("인터페이스 구현 결과가 예상과 다릅니다: %s", iface.Name())
+	}
+}
+
+func TestResolve_InterfaceAndConcreteShareCanonicalSingleton(t *testing.T) {
+	for _, interfaceFirst := range []bool{false, true} {
+		t.Run(map[bool]string{false: "concrete-first", true: "interface-first"}[interfaceFirst], func(t *testing.T) {
+			c := New()
+			calls := 0
+			if err := c.RegisterConstructor(func() *testImpl {
+				calls++
+				return &testImpl{}
+			}); err != nil {
+				t.Fatalf("생성자 등록 실패: %v", err)
+			}
+
+			concreteType := reflect.TypeOf(&testImpl{})
+			interfaceType := reflect.TypeOf((*testIface)(nil)).Elem()
+			firstType, secondType := concreteType, interfaceType
+			if interfaceFirst {
+				firstType, secondType = interfaceType, concreteType
+			}
+
+			first, err := c.Resolve(firstType)
+			if err != nil {
+				t.Fatalf("첫 Resolve 실패: %v", err)
+			}
+			second, err := c.Resolve(secondType)
+			if err != nil {
+				t.Fatalf("두 번째 Resolve 실패: %v", err)
+			}
+			if first != second || calls != 1 {
+				t.Fatalf("interface/concrete는 같은 singleton이어야 합니다: first=%p second=%p calls=%d", first, second, calls)
+			}
+		})
+	}
+}
+
+func TestResolve_ConcurrentInterfaceAndConcreteBuildOnce(t *testing.T) {
+	c := New()
+	release := make(chan struct{})
+	started := make(chan struct{}, 2)
+	var calls atomic.Int32
+	if err := c.RegisterConstructor(func() *testImpl {
+		calls.Add(1)
+		started <- struct{}{}
+		<-release
+		return &testImpl{}
+	}); err != nil {
+		t.Fatalf("생성자 등록 실패: %v", err)
+	}
+
+	types := []reflect.Type{
+		reflect.TypeOf(&testImpl{}),
+		reflect.TypeOf((*testIface)(nil)).Elem(),
+	}
+	results := make(chan any, len(types))
+	errs := make(chan error, len(types))
+	launch := make(chan struct{})
+	for _, target := range types {
+		go func() {
+			<-launch
+			instance, err := c.Resolve(target)
+			results <- instance
+			errs <- err
+		}()
+	}
+	close(launch)
+	<-started
+	close(release)
+
+	first, second := <-results, <-results
+	for range types {
+		if err := <-errs; err != nil {
+			t.Fatalf("동시 interface/concrete Resolve 실패: %v", err)
+		}
+	}
+	if calls.Load() != 1 || first != second {
+		t.Fatalf("동시 alias Resolve도 canonical build 하나를 공유해야 합니다: calls=%d first=%p second=%p", calls.Load(), first, second)
 	}
 }
 
@@ -224,15 +347,11 @@ func TestResolve_InterfaceWithMultipleImplementationsReturnsError(t *testing.T) 
 	}
 }
 
-func TestResolve_ConcurrentConstructorPanicIsReturnedToAllWaiters(t *testing.T) {
+func TestResolve_ConcurrentConstructorPanicsAreReturnedWithoutLeakingPanic(t *testing.T) {
 	c := New()
 
-	started := make(chan struct{})
-	release := make(chan struct{})
 	panicErr := errors.New("constructor panic")
 	if err := c.RegisterConstructor(func() *testRepo {
-		close(started)
-		<-release
 		panic(panicErr)
 	}); err != nil {
 		t.Fatalf("생성자 등록 실패: %v", err)
@@ -252,19 +371,18 @@ func TestResolve_ConcurrentConstructorPanicIsReturnedToAllWaiters(t *testing.T) 
 		res.instance, res.err = c.Resolve(reflect.TypeOf(&testRepo{}))
 	}
 
-	results := make(chan result, 2)
-	go resolve(results)
-	<-started
-	go resolve(results)
-
-	select {
-	case res := <-results:
-		t.Fatalf("두 번째 Resolve는 첫 생성이 끝날 때까지 기다려야 합니다: %+v", res)
-	case <-time.After(20 * time.Millisecond):
+	const resolvers = 32
+	results := make(chan result, resolvers)
+	launch := make(chan struct{})
+	for range resolvers {
+		go func() {
+			<-launch
+			resolve(results)
+		}()
 	}
-	close(release)
+	close(launch)
 
-	for range 2 {
+	for range resolvers {
 		select {
 		case res := <-results:
 			if res.panicVal != nil {
@@ -274,7 +392,7 @@ func TestResolve_ConcurrentConstructorPanicIsReturnedToAllWaiters(t *testing.T) 
 				t.Fatalf("생성 실패 시 인스턴스는 nil이어야 합니다: %T", res.instance)
 			}
 			if !errors.Is(res.err, panicErr) {
-				t.Fatalf("모든 대기자에게 생성자 panic 원인이 전달되어야 합니다: %v", res.err)
+				t.Fatalf("모든 동시 호출에 생성자 panic 원인이 전달되어야 합니다: %v", res.err)
 			}
 		case <-time.After(time.Second):
 			t.Fatal("생성자 panic 이후 Resolve가 종료되지 않았습니다")

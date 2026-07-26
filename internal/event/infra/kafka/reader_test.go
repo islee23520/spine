@@ -1,13 +1,77 @@
 package kafka
 
 import (
+	"context"
 	"crypto/tls"
+	"errors"
 	"testing"
 	"time"
 
+	"github.com/NARUBROWN/spine/internal/event/consumer"
 	"github.com/NARUBROWN/spine/pkg/boot"
 	segmentio "github.com/segmentio/kafka-go"
 )
+
+type fakeKafkaReader struct {
+	messages  []segmentio.Message
+	fetched   int
+	committed []segmentio.Message
+	commitErr error
+	closed    bool
+}
+
+func (r *fakeKafkaReader) FetchMessage(context.Context) (segmentio.Message, error) {
+	if r.fetched >= len(r.messages) {
+		return segmentio.Message{}, errors.New("no more messages")
+	}
+	msg := r.messages[r.fetched]
+	r.fetched++
+	return msg, nil
+}
+
+func (r *fakeKafkaReader) CommitMessages(_ context.Context, messages ...segmentio.Message) error {
+	r.committed = append(r.committed, messages...)
+	return r.commitErr
+}
+
+func (r *fakeKafkaReader) Close() error {
+	r.closed = true
+	return nil
+}
+
+func TestReaderNackRequiresReaderInvalidation(t *testing.T) {
+	backend := &fakeKafkaReader{messages: []segmentio.Message{{Topic: "orders", Partition: 2, Offset: 10, Value: []byte("failed")}}}
+	reader := &Reader{reader: backend}
+	msg, err := reader.Read(context.Background())
+	if err != nil {
+		t.Fatalf("read Kafka message: %v", err)
+	}
+	if err := msg.Nack(); !errors.Is(err, consumer.ErrReaderInvalidated) {
+		t.Fatalf("Kafka NACK must invalidate the reader, got %v", err)
+	}
+	if len(backend.committed) != 0 {
+		t.Fatalf("NACK must not commit an offset: %+v", backend.committed)
+	}
+}
+
+func TestReaderAckReturnsCommitFailure(t *testing.T) {
+	commitErr := errors.New("commit rejected")
+	backend := &fakeKafkaReader{
+		messages:  []segmentio.Message{{Topic: "orders", Partition: 2, Offset: 10, Value: []byte("payload")}},
+		commitErr: commitErr,
+	}
+	reader := &Reader{reader: backend}
+	msg, err := reader.Read(context.Background())
+	if err != nil {
+		t.Fatalf("read Kafka message: %v", err)
+	}
+	if err := msg.Ack(); !errors.Is(err, commitErr) {
+		t.Fatalf("ACK must surface commit failure, got %v", err)
+	}
+	if len(backend.committed) != 1 || backend.committed[0].Offset != 10 {
+		t.Fatalf("ACK committed unexpected messages: %+v", backend.committed)
+	}
+}
 
 func TestEffectiveDialerUsesSharedTLSWithoutMutatingOverride(t *testing.T) {
 	shared := &tls.Config{MinVersion: tls.VersionTLS12, ServerName: "broker.example"}

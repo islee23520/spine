@@ -2,6 +2,7 @@ package bootstrap
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -81,15 +82,28 @@ func Run(config Config) error {
 	if err := Validate(config); err != nil {
 		return err
 	}
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	defer cancelRun()
 
 	// 어떤 전송 방식도 초기화하거나 노출하기 전에 종료 신호를 구독합니다.
 	// 정상 종료를 지원하는 HTTP 런타임과 HTTP가 없는 컨슈머/사용자 정의 런타임이 같은 채널을
 	// 사용하므로 시작 중 신호도 잃지 않고 모든 반환 경로에서 구독을 해제합니다.
 	var shutdownSignals chan os.Signal
+	var shutdownRequested <-chan struct{}
 	if requiresShutdownSignal(config) {
 		shutdownSignals = make(chan os.Signal, 1)
 		signal.Notify(shutdownSignals, syscall.SIGINT, syscall.SIGTERM)
 		defer signal.Stop(shutdownSignals)
+		requested := make(chan struct{})
+		shutdownRequested = requested
+		go func() {
+			select {
+			case <-shutdownSignals:
+				cancelRun()
+				close(requested)
+			case <-runCtx.Done():
+			}
+		}()
 	}
 
 	printBanner()
@@ -144,6 +158,7 @@ func Run(config Config) error {
 			URL:                    config.RabbitMQ.URL,
 			AllowInsecureTransport: config.RabbitMQ.AllowInsecureTransport,
 			ConsumerRetry:          config.RabbitMQ.ConsumerRetry,
+			PublisherRetry:         config.RabbitMQ.PublisherRetry,
 			Write: &boot.RabbitMqWriteOptions{
 				Exchange: config.RabbitMQ.Write.Exchange,
 			},
@@ -177,6 +192,8 @@ func Run(config Config) error {
 	var customTransportErrCh chan error
 	var wsRuntime *ws.Runtime
 	var shutdownHTTPServer func(context.Context) error
+	var consumerRuntimes []*consumer.Runtime
+	var initializedCustomTransports []core.CustomTransport
 	shutdownTimeout := config.ShutdownTimeout
 	if shutdownTimeout == 0 {
 		shutdownTimeout = 10 * time.Second
@@ -185,16 +202,44 @@ func Run(config Config) error {
 	stopCustomTransportOnce := sync.Once{}
 	stopCustomTransports := func(ctx context.Context) {
 		stopCustomTransportOnce.Do(func() {
-			for _, transport := range config.CustomTransports {
-				if transport == nil {
-					continue
-				}
+			for i := len(initializedCustomTransports) - 1; i >= 0; i-- {
+				transport := initializedCustomTransports[i]
 				if err := transport.Stop(ctx); err != nil {
 					log.Printf("[Bootstrap] failed to stop custom transport: %v", err)
 				}
 			}
 		})
 	}
+
+	cleanupOnce := sync.Once{}
+	var cleanupErr error
+	cleanup := func() error {
+		cleanupOnce.Do(func() {
+			// 먼저 ingress를 닫아 종료 중 새 HTTP/WS 작업이 시작되지 않게 합니다.
+			if wsRuntime != nil {
+				wsRuntime.Stop()
+			}
+			if shutdownHTTPServer != nil {
+				ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+				if err := shutdownHTTPServer(ctx); err != nil {
+					cleanupErr = errors.Join(cleanupErr, err)
+					log.Printf("[Bootstrap] failed to shut down HTTP server: %v", err)
+				}
+				cancel()
+			}
+
+			// Consumer Stop은 모든 worker/ACK/NACK/reader 종료가 끝날 때까지 대기하는 계약입니다.
+			for i := len(consumerRuntimes) - 1; i >= 0; i-- {
+				consumerRuntimes[i].Stop()
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+			stopCustomTransports(ctx)
+			cancel()
+		})
+		return cleanupErr
+	}
+	defer cleanup()
 
 	if len(config.CustomTransports) > 0 {
 		log.Printf("[Bootstrap] Initializing custom transports (%d)", len(config.CustomTransports))
@@ -207,22 +252,10 @@ func Run(config Config) error {
 			if err := transport.Init(facade); err != nil {
 				return fmt.Errorf("[Bootstrap] custom transport initialization failed: %w", err)
 			}
+			initializedCustomTransports = append(initializedCustomTransports, transport)
 		}
 
 		customTransportErrCh = make(chan error, len(config.CustomTransports))
-		for _, transport := range config.CustomTransports {
-			go func() {
-				if err := transport.Start(); err != nil {
-					customTransportErrCh <- err
-				}
-			}()
-		}
-
-		defer func() {
-			ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-			defer cancel()
-			stopCustomTransports(ctx)
-		}()
 	}
 
 	if config.HTTP != nil {
@@ -376,8 +409,12 @@ func Run(config Config) error {
 			// WS 전용 인자 리졸버 등록
 			wsPipeline := buildWSPipeline(container, config.WebSocketRegistry, dispatchHook, resolvedWSInterceptors)
 
-			wsRuntime = ws.NewRuntime(config.WebSocketRegistry, wsPipeline, config.HTTP.WebSocket)
-			defer wsRuntime.Stop()
+			wsRuntime = ws.NewRuntime(
+				config.WebSocketRegistry,
+				wsPipeline,
+				config.HTTP.WebSocket,
+				webSocketHandshakeInterceptors(resolvedWSInterceptors)...,
+			)
 
 			// Echo 전송 훅으로 마운트
 			wsMountHook := func(e any) {
@@ -400,7 +437,6 @@ func Run(config Config) error {
 		server = httpEngine.NewServer(httpPipeline, config.Address, config.TransportHooks, *config.HTTP)
 		server.Mount()
 
-		log.Printf("[Bootstrap] Server listening on: %s", config.Address)
 		httpErrCh = make(chan error, 1)
 		shutdownHTTPServerOnce := sync.Once{}
 		var shutdownHTTPServerErr error
@@ -410,20 +446,6 @@ func Run(config Config) error {
 			})
 			return shutdownHTTPServerErr
 		}
-		// HTTP 서버 시작 이후의 모든 반환 경로에서 리스너를 정리합니다. 치명 오류를
-		// 덮어쓰지 않도록 지연 정리 오류는 로그로만 남깁니다.
-		defer func() {
-			ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-			defer cancel()
-			if err := shutdownHTTPServer(ctx); err != nil {
-				log.Printf("[Bootstrap] failed to shut down HTTP server: %v", err)
-			}
-		}()
-		go func() {
-			if err := server.Start(); err != nil && err != http.ErrServerClosed {
-				httpErrCh <- err
-			}
-		}()
 	}
 
 	// 컨슈머 컨트롤러 미리 초기화
@@ -470,13 +492,15 @@ func Run(config Config) error {
 			consumerPipeline,
 		)
 
-		if err := runtime.Validate(); err != nil {
+		if err := runtime.ValidateWithRetry(runCtx); err != nil {
+			if errors.Is(err, context.Canceled) {
+				return cleanup()
+			}
 			return fmt.Errorf("[Bootstrap] Kafka consumer validation failed: %w", err)
 		}
 
 		forwardConsumerErrors("Kafka", runtime, consumerErrCh)
-		go runtime.Start(context.Background())
-		defer runtime.Stop()
+		consumerRuntimes = append(consumerRuntimes, runtime)
 		consumerStarted = true
 	}
 
@@ -500,6 +524,7 @@ func Run(config Config) error {
 			ConsumerRetry:          config.RabbitMQ.ConsumerRetry,
 			Read: &boot.RabbitMqReadOptions{
 				Exchange:       config.RabbitMQ.Read.Exchange,
+				PrefetchCount:  config.RabbitMQ.Read.PrefetchCount,
 				FailurePolicy:  config.RabbitMQ.Read.FailurePolicy,
 				DeadLetter:     config.RabbitMQ.Read.DeadLetter,
 				RequeueOnError: config.RabbitMQ.Read.RequeueOnError,
@@ -514,14 +539,41 @@ func Run(config Config) error {
 			consumerPipeline,
 		)
 
-		if err := runtime.Validate(); err != nil {
+		if err := runtime.ValidateWithRetry(runCtx); err != nil {
+			if errors.Is(err, context.Canceled) {
+				return cleanup()
+			}
 			return fmt.Errorf("[Bootstrap] RabbitMQ consumer validation failed: %w", err)
 		}
 
 		forwardConsumerErrors("RabbitMQ", runtime, consumerErrCh)
-		go runtime.Start(context.Background())
-		defer runtime.Stop()
+		consumerRuntimes = append(consumerRuntimes, runtime)
 		consumerStarted = true
+	}
+
+	// expose 단계: 모든 DI warm-up과 broker runtime validation이 성공한 뒤에만
+	// 장기 실행 runtime과 마지막으로 HTTP listener를 시작합니다.
+	if runCtx.Err() != nil {
+		return cleanup()
+	}
+	for _, runtime := range consumerRuntimes {
+		go runtime.Start(runCtx)
+	}
+	for _, transport := range initializedCustomTransports {
+		transport := transport
+		go func() {
+			if err := transport.Start(); err != nil {
+				customTransportErrCh <- err
+			}
+		}()
+	}
+	if server != nil {
+		log.Printf("[Bootstrap] Server listening on: %s", config.Address)
+		go func() {
+			if err := server.Start(); err != nil && err != http.ErrServerClosed {
+				httpErrCh <- err
+			}
+		}()
 	}
 
 	if config.HTTP != nil {
@@ -549,21 +601,11 @@ func Run(config Config) error {
 			return err
 		case err := <-customTransportErrCh:
 			return err
-		case <-shutdownSignals:
+		case <-shutdownRequested:
 		}
 
 		log.Println("[Bootstrap] Shutdown signal received. Starting graceful shutdown...")
-
-		if wsRuntime != nil {
-			wsRuntime.Stop()
-		}
-
-		ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-		defer cancel()
-
-		stopCustomTransports(ctx)
-
-		if err := shutdownHTTPServer(ctx); err != nil {
+		if err := cleanup(); err != nil {
 			return fmt.Errorf("[Bootstrap] forced server shutdown: %v", err)
 		}
 
@@ -573,7 +615,7 @@ func Run(config Config) error {
 	// HTTP가 비활성화된 상태에서 이벤트 컨슈머만 실행 중이면 종료 신호를 기다린다.
 	if config.HTTP == nil && (consumerStarted || customTransportErrCh != nil) {
 		select {
-		case <-shutdownSignals:
+		case <-shutdownRequested:
 			log.Println("[Bootstrap] Shutdown signal received. Stopping runtimes...")
 		case err := <-consumerErrCh:
 			return err
@@ -581,9 +623,7 @@ func Run(config Config) error {
 			return err
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-		defer cancel()
-		stopCustomTransports(ctx)
+		_ = cleanup()
 	}
 
 	return nil
@@ -607,6 +647,14 @@ func requiresShutdownSignal(config Config) bool {
 // 사용자가 조치할 수 있는 모든 설정 문제를 하나의 오류로 반환합니다.
 func Validate(config Config) error {
 	var issues []boot.ConfigIssue
+	if config.ShutdownTimeout < 0 {
+		issues = append(issues, boot.ConfigIssue{
+			Path:    "ShutdownTimeout",
+			Code:    "SHUTDOWN_TIMEOUT_INVALID",
+			Message: "Shutdown timeout cannot be negative.",
+			Hint:    "Use zero for the default or a positive duration.",
+		})
+	}
 	if config.Kafka != nil {
 		issues = append(issues, config.Kafka.ValidateIssues("Kafka")...)
 	}
@@ -702,6 +750,16 @@ func resolveGlobalInterceptors(ctr *container.Container, config Config) ([]core.
 		}
 	}
 	return resolvedHTTP, resolvedWS, nil
+}
+
+func webSocketHandshakeInterceptors(interceptors []core.Interceptor) []core.WebSocketHandshakeInterceptor {
+	handshakeInterceptors := make([]core.WebSocketHandshakeInterceptor, 0, len(interceptors))
+	for _, interceptor := range interceptors {
+		if handshakeInterceptor, ok := interceptor.(core.WebSocketHandshakeInterceptor); ok {
+			handshakeInterceptors = append(handshakeInterceptors, handshakeInterceptor)
+		}
+	}
+	return handshakeInterceptors
 }
 
 // globalInterceptorIdentity는 Go에서 실제 인스턴스의 정체성을 보존할 수 있을 때만
@@ -824,7 +882,7 @@ func waitConsumerError(errors <-chan error, done <-chan struct{}) error {
 }
 
 const (
-	spineVersion = "v0.5.0"
+	spineVersion = "v0.5.1"
 	spineBanner  = `
 ________       _____             
 __  ___/__________(_)___________ 

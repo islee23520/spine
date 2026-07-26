@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"errors"
+	"net/http"
 	"reflect"
 	"strings"
 	"testing"
@@ -15,6 +16,7 @@ import (
 	"github.com/NARUBROWN/spine/internal/resolver"
 	"github.com/NARUBROWN/spine/pkg/event/publish"
 	"github.com/NARUBROWN/spine/pkg/httperr"
+	"github.com/NARUBROWN/spine/pkg/httpx"
 	"github.com/NARUBROWN/spine/pkg/path"
 )
 
@@ -153,6 +155,7 @@ type testResponseWriter struct {
 	status    int
 	body      any
 	writes    int
+	writeErr  error
 }
 
 func (w *testResponseWriter) SetHeader(key, value string) {}
@@ -162,28 +165,28 @@ func (w *testResponseWriter) WriteStatus(status int) error {
 	w.committed = true
 	w.status = status
 	w.writes++
-	return nil
+	return w.writeErr
 }
 func (w *testResponseWriter) WriteJSON(status int, value any) error {
 	w.committed = true
 	w.status = status
 	w.body = value
 	w.writes++
-	return nil
+	return w.writeErr
 }
 func (w *testResponseWriter) WriteString(status int, value string) error {
 	w.committed = true
 	w.status = status
 	w.body = value
 	w.writes++
-	return nil
+	return w.writeErr
 }
 func (w *testResponseWriter) WriteBytes(status int, value []byte) error {
 	w.committed = true
 	w.status = status
 	w.body = value
 	w.writes++
-	return nil
+	return w.writeErr
 }
 
 type testController struct {
@@ -208,6 +211,23 @@ func (c *testController) Panic() string {
 type pathController struct{}
 
 func (c *pathController) Mixed(id path.Int, count int, name path.String) {}
+
+type invalidJSONController struct{}
+
+func (*invalidJSONController) Handle() httpx.Response[any] {
+	return httpx.Response[any]{Body: make(chan int)}
+}
+
+type invalidCookieController struct{}
+
+func (*invalidCookieController) Handle() httpx.Response[string] {
+	return httpx.Response[string]{
+		Body: "ok",
+		Options: httpx.ResponseOptions{
+			Cookies: []httpx.Cookie{{Name: "session\r\nInjected", Value: "value"}},
+		},
+	}
+}
 
 func newPipelineWithController(t *testing.T, methodName string, called *int) (*Pipeline, core.HandlerMeta) {
 	t.Helper()
@@ -283,11 +303,11 @@ func TestExecute_SuccessFlow(t *testing.T) {
 	expected := []string{
 		"pre:global",
 		"pre:route",
-		"before:route",
-		"before:global",
 		"handle:success",
 		"post:route",
 		"post:global",
+		"before:route",
+		"before:global",
 		"after:route",
 		"after:global",
 	}
@@ -301,7 +321,7 @@ func TestExecute_SuccessFlow(t *testing.T) {
 	}
 }
 
-func TestExecute_PostHookFailurePreventsSuccessHandling(t *testing.T) {
+func TestExecute_PostHookFailureDiscardsPreparedSuccessResponse(t *testing.T) {
 	controllerCalled := 0
 	p, _ := newPipelineWithController(t, "Handle", &controllerCalled)
 
@@ -319,7 +339,7 @@ func TestExecute_PostHookFailurePreventsSuccessHandling(t *testing.T) {
 			if !ok {
 				t.Fatal("response writer가 주입되어야 합니다")
 			}
-			rw := rwAny.(*testResponseWriter)
+			rw := rwAny.(core.ResponseWriter)
 			return rw.WriteStatus(204)
 		},
 	})
@@ -338,11 +358,11 @@ func TestExecute_PostHookFailurePreventsSuccessHandling(t *testing.T) {
 	if !postHook.called {
 		t.Fatal("post hook이 호출되어야 합니다")
 	}
-	if handled {
-		t.Fatal("post hook 실패 후 성공 응답을 작성하면 안 됩니다")
+	if !handled {
+		t.Fatal("post hook 전에 성공 응답을 staging해야 합니다")
 	}
-	if writer.status != 500 {
-		t.Fatalf("post hook 실패는 성공 응답 전에 500으로 기록되어야 합니다: %d", writer.status)
+	if writer.status != 500 || writer.writes != 1 {
+		t.Fatalf("post hook 실패는 staged 성공 응답 대신 500 하나만 기록해야 합니다: status=%d writes=%d", writer.status, writer.writes)
 	}
 }
 
@@ -472,7 +492,7 @@ func TestExecute_MissingArgumentResolverReturnsError(t *testing.T) {
 	}
 }
 
-func TestExecute_PostHooksRunBeforeSuccessReturnHandling(t *testing.T) {
+func TestExecute_ResponsePreparationFailureSkipsPostHooks(t *testing.T) {
 	controllerCalled := 0
 	p, _ := newPipelineWithController(t, "Handle", &controllerCalled)
 
@@ -498,8 +518,8 @@ func TestExecute_PostHooksRunBeforeSuccessReturnHandling(t *testing.T) {
 	if err == nil {
 		t.Fatal("리턴 핸들러 실패는 에러여야 합니다")
 	}
-	if !postHook.called {
-		t.Fatal("post hook은 성공 응답 작성 전에 실행되어야 합니다")
+	if postHook.called {
+		t.Fatal("응답 준비 실패 후 post hook을 실행하면 안 됩니다")
 	}
 }
 
@@ -651,7 +671,11 @@ func TestExecute_BeforeResponseFailurePreventsSuccessWrite(t *testing.T) {
 		supports: func(rt reflect.Type) bool { return rt.Kind() == reflect.String },
 		handle: func(v any, ctx core.ExecutionContext) error {
 			successHandled = true
-			return writer.WriteString(200, v.(string))
+			rwAny, ok := ctx.Get("spine.response_writer")
+			if !ok {
+				t.Fatal("response writer가 주입되어야 합니다")
+			}
+			return rwAny.(core.ResponseWriter).WriteString(200, v.(string))
 		},
 	})
 
@@ -659,11 +683,121 @@ func TestExecute_BeforeResponseFailurePreventsSuccessWrite(t *testing.T) {
 	if !errors.Is(err, commitErr) {
 		t.Fatalf("BeforeResponse 오류가 최종 오류로 전파되어야 합니다: %v", err)
 	}
-	if successHandled {
-		t.Fatal("commit 실패 후 성공 ReturnValueHandler를 호출하면 안 됩니다")
+	if !successHandled {
+		t.Fatal("commit 전에 성공 응답을 staging해야 합니다")
 	}
 	if writer.status != 500 || writer.writes != 1 {
 		t.Fatalf("commit 실패는 성공 응답 대신 500이어야 합니다: status=%d writes=%d", writer.status, writer.writes)
+	}
+}
+
+func TestExecute_ResponsePreparationFailureReachesBeforeResponseBeforeCommit(t *testing.T) {
+	ctr := container.New()
+	if err := ctr.RegisterConstructor(func() *invalidJSONController { return &invalidJSONController{} }); err != nil {
+		t.Fatal(err)
+	}
+	controllerType := reflect.TypeFor[*invalidJSONController]()
+	method, ok := controllerType.MethodByName("Handle")
+	if !ok {
+		t.Fatal("Handle 메서드를 찾을 수 없습니다")
+	}
+	p := NewPipeline(
+		&testRouter{meta: core.HandlerMeta{ControllerType: controllerType, Method: method}},
+		invoker.NewInvoker(ctr),
+	)
+	p.AddReturnValueHandler(&handler.JSONReturnHandler{}, &handler.ErrorReturnHandler{})
+	postHook := &testPostHook{}
+	p.AddPostExecutionHook(postHook)
+
+	events := []string{}
+	var beforeErr error
+	p.AddInterceptor(&testInterceptor{
+		name:   "tx",
+		events: &events,
+		before: func(_ core.HandlerMeta, err error) { beforeErr = err },
+	})
+	ctx := newTestExecutionContext()
+	writer := &testResponseWriter{}
+	ctx.Set("spine.response_writer", writer)
+
+	err := p.Execute(ctx)
+	if err == nil || !strings.Contains(err.Error(), "unsupported type") {
+		t.Fatalf("JSON 직렬화 실패가 최종 오류여야 합니다: %v", err)
+	}
+	if beforeErr == nil || !strings.Contains(beforeErr.Error(), "unsupported type") {
+		t.Fatalf("BeforeResponse는 성공이 아니라 응답 준비 실패를 받아야 합니다: %v", beforeErr)
+	}
+	if postHook.called {
+		t.Fatal("JSON 직렬화 실패 후 domain-event post hook을 실행하면 안 됩니다")
+	}
+	if writer.status != http.StatusInternalServerError || writer.writes != 1 {
+		t.Fatalf("실패한 성공 응답 대신 500 하나만 기록되어야 합니다: status=%d writes=%d", writer.status, writer.writes)
+	}
+}
+
+func TestExecute_CookieValidationFailureReachesBeforeResponseBeforeCommit(t *testing.T) {
+	ctr := container.New()
+	if err := ctr.RegisterConstructor(func() *invalidCookieController { return &invalidCookieController{} }); err != nil {
+		t.Fatal(err)
+	}
+	controllerType := reflect.TypeFor[*invalidCookieController]()
+	method, ok := controllerType.MethodByName("Handle")
+	if !ok {
+		t.Fatal("Handle 메서드를 찾을 수 없습니다")
+	}
+	p := NewPipeline(
+		&testRouter{meta: core.HandlerMeta{ControllerType: controllerType, Method: method}},
+		invoker.NewInvoker(ctr),
+	)
+	p.AddReturnValueHandler(&handler.StringReturnHandler{}, &handler.ErrorReturnHandler{})
+
+	var beforeErr error
+	p.AddInterceptor(&testInterceptor{
+		name:   "tx",
+		events: &[]string{},
+		before: func(_ core.HandlerMeta, err error) { beforeErr = err },
+	})
+	ctx := newTestExecutionContext()
+	writer := &testResponseWriter{}
+	ctx.Set("spine.response_writer", writer)
+
+	err := p.Execute(ctx)
+	if err == nil || !strings.Contains(err.Error(), "invalid cookie") {
+		t.Fatalf("쿠키 검증 실패가 최종 오류여야 합니다: %v", err)
+	}
+	if beforeErr == nil || !strings.Contains(beforeErr.Error(), "invalid cookie") {
+		t.Fatalf("BeforeResponse는 응답 준비 중 쿠키 검증 실패를 받아야 합니다: %v", beforeErr)
+	}
+	if writer.status != http.StatusInternalServerError || writer.writes != 1 {
+		t.Fatalf("실패한 성공 응답 대신 500 하나만 기록되어야 합니다: status=%d writes=%d", writer.status, writer.writes)
+	}
+}
+
+func TestExecute_StagedTransportWriteFailureIsReturned(t *testing.T) {
+	controllerCalled := 0
+	p, _ := newPipelineWithController(t, "Handle", &controllerCalled)
+	p.AddArgumentResolver(&testArgumentResolver{
+		supports: func(pm resolver.ParameterMeta) bool { return pm.Type.Kind() == reflect.Int },
+		resolve:  func(core.ExecutionContext, resolver.ParameterMeta) (any, error) { return 7, nil },
+	})
+	p.AddReturnValueHandler(&testReturnHandler{
+		supports: func(rt reflect.Type) bool { return rt.Kind() == reflect.String },
+		handle: func(value any, ctx core.ExecutionContext) error {
+			rw, _ := ctx.Get("spine.response_writer")
+			return rw.(core.ResponseWriter).WriteString(http.StatusOK, value.(string))
+		},
+	})
+	writeErr := errors.New("socket write failed")
+	writer := &testResponseWriter{writeErr: writeErr}
+	ctx := newTestExecutionContext()
+	ctx.Set("spine.response_writer", writer)
+
+	err := p.Execute(ctx)
+	if !errors.Is(err, writeErr) {
+		t.Fatalf("실제 transport 쓰기 실패가 최종 오류에 보존되어야 합니다: %v", err)
+	}
+	if writer.writes != 1 {
+		t.Fatalf("커밋된 transport 실패 뒤 이중 응답을 시도하면 안 됩니다: writes=%d", writer.writes)
 	}
 }
 
@@ -697,6 +831,34 @@ func TestHandleExecutionError_WritesInternalServerError(t *testing.T) {
 
 	if writer.writes != 1 || writer.status != 500 {
 		t.Fatalf("500 응답은 한 번만 기록되어야 합니다. 실제 writes=%d status=%d", writer.writes, writer.status)
+	}
+}
+
+func TestHandleExecutionError_InvalidStatusFallsBackAndReportsConfigurationError(t *testing.T) {
+	p := &Pipeline{}
+	ctx := newTestExecutionContext()
+	writer := &testResponseWriter{}
+	ctx.Set("spine.response_writer", writer)
+
+	err := p.handleExecutionError(ctx, &httperr.HTTPError{Status: 42, Message: "invalid"})
+	if err == nil || !strings.Contains(err.Error(), "invalid HTTP error status 42") {
+		t.Fatalf("잘못된 status가 명시적 오류여야 합니다: %v", err)
+	}
+	if writer.writes != 1 || writer.status != http.StatusInternalServerError {
+		t.Fatalf("잘못된 status는 안전한 500으로 대체되어야 합니다: writes=%d status=%d", writer.writes, writer.status)
+	}
+}
+
+func TestHandleExecutionError_PreservesWriteFailure(t *testing.T) {
+	p := &Pipeline{}
+	ctx := newTestExecutionContext()
+	writeErr := errors.New("write failed")
+	writer := &testResponseWriter{writeErr: writeErr}
+	ctx.Set("spine.response_writer", writer)
+
+	err := p.handleExecutionError(ctx, errors.New("boom"))
+	if !errors.Is(err, writeErr) {
+		t.Fatalf("오류 응답 쓰기 실패가 보존되어야 합니다: %v", err)
 	}
 }
 

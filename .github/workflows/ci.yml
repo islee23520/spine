@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - main
+    tags:
+      - "v*"
   pull_request:
     branches:
       - main
@@ -21,7 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
-      GOCACHE: /tmp/gocache
+      GOCACHE: ${{ runner.temp }}/gocache
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -54,11 +56,15 @@ jobs:
           git diff --exit-code -- go.mod go.sum
 
   unit:
-    name: Unit Tests
-    runs-on: ubuntu-latest
+    name: Unit Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     env:
-      GOCACHE: /tmp/gocache
+      GOCACHE: ${{ runner.temp }}/gocache
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -73,6 +79,7 @@ jobs:
         run: go mod download
 
       - name: Run unit tests
+        shell: bash
         run: |
           packages=$(go list ./... | grep -v '/test$')
           if [ -z "$packages" ]; then
@@ -82,11 +89,15 @@ jobs:
           go test $packages -count=1 -shuffle=on -timeout=8m
 
   integration:
-    name: Integration Tests
-    runs-on: ubuntu-latest
+    name: Integration Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     env:
-      GOCACHE: /tmp/gocache
+      GOCACHE: ${{ runner.temp }}/gocache
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -104,11 +115,15 @@ jobs:
         run: go test ./test -run '^TestAppIntegration_' -count=1 -shuffle=on -timeout=8m
 
   e2e:
-    name: End-to-End Tests
-    runs-on: ubuntu-latest
+    name: End-to-End Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     env:
-      GOCACHE: /tmp/gocache
+      GOCACHE: ${{ runner.temp }}/gocache
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -130,7 +145,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
-      GOCACHE: /tmp/gocache
+      GOCACHE: ${{ runner.temp }}/gocache
     steps:
       - name: Checkout
         uses: actions/checkout@v4

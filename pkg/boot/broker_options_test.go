@@ -3,6 +3,7 @@ package boot
 import (
 	"crypto/tls"
 	"testing"
+	"time"
 
 	"github.com/segmentio/kafka-go"
 )
@@ -144,5 +145,60 @@ func TestRabbitMqOptionsValidateIssuesRequiresWriteExchange(t *testing.T) {
 	}
 	if issues[0].Code != "RABBITMQ_WRITE_EXCHANGE_REQUIRED" || issues[0].Path != "Messaging.RabbitMQ.Write.Exchange" {
 		t.Fatalf("unexpected structured issue: %+v", issues[0])
+	}
+}
+
+func TestRabbitMqReadOptionsEffectivePrefetchCount(t *testing.T) {
+	if got := (RabbitMqReadOptions{}).EffectivePrefetchCount(); got != 1 {
+		t.Fatalf("zero value must select safe prefetch 1, got %d", got)
+	}
+	if got := (RabbitMqReadOptions{PrefetchCount: 32}).EffectivePrefetchCount(); got != 32 {
+		t.Fatalf("explicit positive prefetch must be preserved, got %d", got)
+	}
+}
+
+func TestRabbitMqOptionsValidateIssuesRejectsInvalidPrefetch(t *testing.T) {
+	opts := RabbitMqOptions{
+		URL: "amqps://broker.example:5671/",
+		Read: &RabbitMqReadOptions{
+			Exchange:      "events",
+			PrefetchCount: -1,
+		},
+	}
+	issues := opts.ValidateIssues("RabbitMQ")
+	if len(issues) != 1 || issues[0].Code != "RABBITMQ_PREFETCH_COUNT_INVALID" {
+		t.Fatalf("expected invalid prefetch issue: %+v", issues)
+	}
+}
+
+func TestRabbitMqOptionsValidateIssuesRejectsInvalidPublisherRetry(t *testing.T) {
+	opts := RabbitMqOptions{
+		URL:   "amqps://broker.example:5671/",
+		Write: &RabbitMqWriteOptions{Exchange: "events"},
+		PublisherRetry: PublisherRetryOptions{
+			InitialDelay:   2 * time.Second,
+			MaxDelay:       time.Second,
+			Multiplier:     0.5,
+			Jitter:         1.1,
+			MaxAttempts:    -1,
+			ConfirmTimeout: -time.Second,
+		},
+	}
+	issues := opts.ValidateIssues("RabbitMQ")
+	expectedCodes := map[string]struct{}{
+		"RABBITMQ_PUBLISHER_RETRY_DELAY_RANGE_INVALID":  {},
+		"RABBITMQ_PUBLISHER_RETRY_MULTIPLIER_INVALID":   {},
+		"RABBITMQ_PUBLISHER_RETRY_JITTER_INVALID":       {},
+		"RABBITMQ_PUBLISHER_RETRY_MAX_ATTEMPTS_INVALID": {},
+		"RABBITMQ_PUBLISHER_CONFIRM_TIMEOUT_INVALID":    {},
+	}
+	for _, issue := range issues {
+		if _, ok := expectedCodes[issue.Code]; !ok {
+			t.Fatalf("예상하지 못한 publisher retry issue입니다: %+v", issue)
+		}
+		delete(expectedCodes, issue.Code)
+	}
+	if len(expectedCodes) != 0 {
+		t.Fatalf("누락된 publisher retry issue code가 있습니다: %v (actual=%+v)", expectedCodes, issues)
 	}
 }

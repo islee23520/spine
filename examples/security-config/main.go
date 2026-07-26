@@ -42,6 +42,7 @@ func secureOptions(rabbitURL string) boot.Options {
 			URL: rabbitURL,
 			Read: &boot.RabbitMqReadOptions{
 				Exchange:      "events",
+				PrefetchCount: 16,
 				FailurePolicy: boot.RabbitMqFailureReject,
 				DeadLetter: &boot.RabbitMqDeadLetterOptions{
 					Exchange:   "events.dlx",

@@ -74,6 +74,20 @@ func TestEventNameResolver(t *testing.T) {
 	}
 }
 
+func TestEventNameResolver_ConvertsNamedString(t *testing.T) {
+	type eventName string
+	r := &EventNameResolver{}
+	pm := internalresolver.ParameterMeta{Type: reflect.TypeFor[eventName]()}
+
+	val, err := r.Resolve(newTestConsumerContext("order.created", nil), pm)
+	if err != nil {
+		t.Fatalf("named string Resolve 실패: %v", err)
+	}
+	if got, ok := val.(eventName); !ok || got != "order.created" {
+		t.Fatalf("요청한 named string 타입으로 반환되어야 합니다: %T %v", val, val)
+	}
+}
+
 func TestPayloadResolver(t *testing.T) {
 	r := &PayloadResolver{}
 	pm := internalresolver.ParameterMeta{Type: reflect.TypeOf([]byte{})}
@@ -95,6 +109,20 @@ func TestPayloadResolver(t *testing.T) {
 	}
 	if _, err := r.Resolve(&nonConsumerContext{}, pm); err == nil {
 		t.Fatal("ConsumerRequestContext가 아니면 에러여야 합니다")
+	}
+}
+
+func TestPayloadResolver_ConvertsNamedByteSlice(t *testing.T) {
+	type payload []byte
+	r := &PayloadResolver{}
+	pm := internalresolver.ParameterMeta{Type: reflect.TypeFor[payload]()}
+
+	val, err := r.Resolve(newTestConsumerContext("order.created", []byte("hello")), pm)
+	if err != nil {
+		t.Fatalf("named []byte Resolve 실패: %v", err)
+	}
+	if got, ok := val.(payload); !ok || string(got) != "hello" {
+		t.Fatalf("요청한 named []byte 타입으로 반환되어야 합니다: %T %v", val, val)
 	}
 }
 

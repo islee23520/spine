@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -28,6 +29,43 @@ type testTransport struct {
 	startCalls atomic.Int32
 	stopCalls  atomic.Int32
 }
+
+type orderedTransport struct {
+	id        string
+	initErr   error
+	stopMu    *sync.Mutex
+	stopOrder *[]string
+}
+
+func (t *orderedTransport) Init(core.Container) error { return t.initErr }
+func (*orderedTransport) Start() error                { return nil }
+func (t *orderedTransport) Stop(context.Context) error {
+	t.stopMu.Lock()
+	defer t.stopMu.Unlock()
+	*t.stopOrder = append(*t.stopOrder, t.id)
+	return nil
+}
+
+type blockingStopTransport struct {
+	stopStarted chan struct{}
+	stopRelease chan struct{}
+}
+
+func (*blockingStopTransport) Init(core.Container) error { return nil }
+func (*blockingStopTransport) Start() error              { return errors.New("runtime failed") }
+func (t *blockingStopTransport) Stop(context.Context) error {
+	close(t.stopStarted)
+	<-t.stopRelease
+	return nil
+}
+
+type delayedFailConsumer struct{}
+
+func (*delayedFailConsumer) Handle() {}
+
+type missingWarmUpConsumer struct{}
+
+func (*missingWarmUpConsumer) Handle() {}
 
 type listenerFatalTransport struct {
 	address          string
@@ -144,6 +182,27 @@ func TestRun_CustomTransportInitError(t *testing.T) {
 	}
 }
 
+func TestRun_CustomTransportPartialInitStopsOnlySuccessfulTransportsInReverseOrder(t *testing.T) {
+	var mu sync.Mutex
+	var stopOrder []string
+	first := &orderedTransport{id: "A", stopMu: &mu, stopOrder: &stopOrder}
+	second := &orderedTransport{id: "B", stopMu: &mu, stopOrder: &stopOrder}
+	failed := &orderedTransport{id: "C", initErr: errors.New("C init failed"), stopMu: &mu, stopOrder: &stopOrder}
+
+	err := Run(Config{
+		CustomTransports: []core.CustomTransport{first, second, failed},
+		ShutdownTimeout:  time.Second,
+	})
+	if err == nil || !strings.Contains(err.Error(), "C init failed") {
+		t.Fatalf("partial init error = %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if got := strings.Join(stopOrder, ","); got != "B,A" {
+		t.Fatalf("partial-init cleanup order = %q, want B,A", got)
+	}
+}
+
 func TestRun_CustomTransportStartError(t *testing.T) {
 	transport := &testTransport{startErr: errors.New("start fail")}
 
@@ -159,6 +218,156 @@ func TestRun_CustomTransportStartError(t *testing.T) {
 	}
 	if transport.stopCalls.Load() != 1 {
 		t.Fatalf("Start 실패 후에도 Stop이 호출되어야 합니다: %d", transport.stopCalls.Load())
+	}
+}
+
+func TestRun_WaitsForCustomTransportStopBeforeReturning(t *testing.T) {
+	transport := &blockingStopTransport{
+		stopStarted: make(chan struct{}),
+		stopRelease: make(chan struct{}),
+	}
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- Run(Config{CustomTransports: []core.CustomTransport{transport}, ShutdownTimeout: time.Second})
+	}()
+
+	select {
+	case <-transport.stopStarted:
+	case <-time.After(time.Second):
+		t.Fatal("custom transport Stop was not started")
+	}
+	select {
+	case err := <-runDone:
+		t.Fatalf("Run returned before Stop completed: %v", err)
+	default:
+	}
+	close(transport.stopRelease)
+	select {
+	case err := <-runDone:
+		if err == nil || !strings.Contains(err.Error(), "runtime failed") {
+			t.Fatalf("Run error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Run did not return after Stop completed")
+	}
+}
+
+func TestValidate_RejectsNegativeShutdownTimeout(t *testing.T) {
+	err := Validate(Config{ShutdownTimeout: -time.Nanosecond})
+	configErr, ok := err.(*boot.ConfigError)
+	if !ok {
+		t.Fatalf("Validate error = %T, want *boot.ConfigError", err)
+	}
+	if len(configErr.Issues) != 1 || configErr.Issues[0].Path != "ShutdownTimeout" || configErr.Issues[0].Code != "SHUTDOWN_TIMEOUT_INVALID" {
+		t.Fatalf("unexpected validation issues: %+v", configErr.Issues)
+	}
+}
+
+func TestRun_DoesNotExposeHTTPListenerBeforeConsumerWarmUpSucceeds(t *testing.T) {
+	reserved, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve HTTP address: %v", err)
+	}
+	address := reserved.Addr().String()
+	if err := reserved.Close(); err != nil {
+		t.Fatalf("release HTTP address: %v", err)
+	}
+
+	warmUpStarted := make(chan struct{})
+	releaseWarmUp := make(chan struct{})
+	registry := consumer.NewRegistry()
+	if err := registry.Register("warm-up", (*delayedFailConsumer).Handle); err != nil {
+		t.Fatalf("register consumer: %v", err)
+	}
+	if err := registry.Register("missing", (*missingWarmUpConsumer).Handle); err != nil {
+		t.Fatalf("register missing consumer: %v", err)
+	}
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- Run(Config{
+			Address: address,
+			HTTP:    &boot.HTTPOptions{},
+			Constructors: []any{func() *delayedFailConsumer {
+				close(warmUpStarted)
+				<-releaseWarmUp
+				return &delayedFailConsumer{}
+			}},
+			ConsumerRegistry: registry,
+			ShutdownTimeout:  time.Second,
+		})
+	}()
+
+	select {
+	case <-warmUpStarted:
+	case <-time.After(time.Second):
+		close(releaseWarmUp)
+		t.Fatal("consumer warm-up did not start")
+	}
+	deadline := time.Now().Add(250 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		conn, dialErr := net.DialTimeout("tcp", address, 20*time.Millisecond)
+		if dialErr == nil {
+			_ = conn.Close()
+			close(releaseWarmUp)
+			<-runDone
+			t.Fatal("HTTP listener was exposed while consumer warm-up was incomplete")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	close(releaseWarmUp)
+	select {
+	case err := <-runDone:
+		if err == nil || !strings.Contains(err.Error(), "consumer controller warm-up failed") {
+			t.Fatalf("Run error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Run did not return after consumer warm-up failure")
+	}
+}
+
+func TestRun_DoesNotExposeHTTPListenerWhenKafkaStartupHandshakeFails(t *testing.T) {
+	httpReservation, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve HTTP address: %v", err)
+	}
+	httpAddress := httpReservation.Addr().String()
+	_ = httpReservation.Close()
+	brokerReservation, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve broker address: %v", err)
+	}
+	brokerAddress := brokerReservation.Addr().String()
+	_ = brokerReservation.Close()
+
+	registry := consumer.NewRegistry()
+	if err := registry.Register("orders", (*testController).Handle); err != nil {
+		t.Fatalf("register consumer: %v", err)
+	}
+	err = Run(Config{
+		Address:          httpAddress,
+		HTTP:             &boot.HTTPOptions{},
+		Constructors:     []any{func() *testController { return &testController{} }},
+		ConsumerRegistry: registry,
+		Kafka: &boot.KafkaOptions{
+			Brokers:                []string{brokerAddress},
+			AllowInsecureTransport: true,
+			ConsumerRetry: boot.ConsumerRetryOptions{
+				InitialDelay: time.Millisecond,
+				MaxDelay:     time.Millisecond,
+				Multiplier:   1,
+				MaxAttempts:  1,
+			},
+			Read: &boot.KafkaReadOptions{GroupID: "startup-validation"},
+		},
+		ShutdownTimeout: time.Second,
+	})
+	if err == nil || !strings.Contains(err.Error(), "Kafka consumer validation failed") {
+		t.Fatalf("Kafka startup handshake failure must abort Run: %v", err)
+	}
+	conn, dialErr := net.DialTimeout("tcp", httpAddress, 50*time.Millisecond)
+	if dialErr == nil {
+		_ = conn.Close()
+		t.Fatal("HTTP listener was exposed despite Kafka startup handshake failure")
 	}
 }
 
@@ -299,9 +508,9 @@ func TestValidate_RejectsInvalidInterceptorScopeBeforeStartup(t *testing.T) {
 	}
 }
 
-func TestSpineVersionMatchesV05Migration(t *testing.T) {
-	if spineVersion != "v0.5.0" {
-		t.Fatalf("runtime version = %q, want v0.5.0", spineVersion)
+func TestSpineVersionMatchesV051Release(t *testing.T) {
+	if spineVersion != "v0.5.1" {
+		t.Fatalf("runtime version = %q, want v0.5.1", spineVersion)
 	}
 }
 
@@ -369,7 +578,22 @@ func TestResolveGlobalInterceptorsMergesTypedNilPlaceholderByType(t *testing.T) 
 	}
 }
 
+func TestWebSocketHandshakeInterceptorsSelectsOnlyOptionalCapability(t *testing.T) {
+	handshake := &bootstrapHandshakeInterceptor{}
+	regular := &bootstrapTestInterceptor{}
+	selected := webSocketHandshakeInterceptors([]core.Interceptor{regular, handshake})
+	if len(selected) != 1 || selected[0] != handshake {
+		t.Fatalf("selected handshake interceptors = %v, want only %T", selected, handshake)
+	}
+}
+
 type bootstrapTestInterceptor struct{ calls atomic.Int32 }
+
+type bootstrapHandshakeInterceptor struct{ bootstrapTestInterceptor }
+
+func (*bootstrapHandshakeInterceptor) PreHandshake(core.WebSocketHandshakeContext, core.HandlerMeta) error {
+	return nil
+}
 
 func (i *bootstrapTestInterceptor) PreHandle(core.ExecutionContext, core.HandlerMeta) error {
 	i.calls.Add(1)

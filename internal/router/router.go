@@ -90,35 +90,8 @@ func (r *DefaultRouter) Route(ctx core.ExecutionContext) (core.HandlerMeta, erro
 	}
 
 	pathSegs := splitPath(ctx.Path())
-	node := root
-
-	var params map[string]string
-	var pathKeys []string
-
-	for _, seg := range pathSegs {
-		if node.staticChildren != nil {
-			if child := node.staticChildren[seg]; child != nil {
-				node = child
-				continue
-			}
-		}
-
-		if node.paramChild == nil {
-			return core.HandlerMeta{}, httperr.NotFound("handler not found")
-		}
-
-		if params == nil {
-			params = make(map[string]string, len(pathSegs))
-		}
-		if pathKeys == nil {
-			pathKeys = make([]string, 0, len(pathSegs))
-		}
-		params[node.paramChild.paramKey] = seg
-		pathKeys = append(pathKeys, node.paramChild.paramKey)
-		node = node.paramChild
-	}
-
-	if node.meta == nil {
+	node, params, ok := findRoute(root, pathSegs, 0, nil)
+	if !ok {
 		return core.HandlerMeta{}, httperr.NotFound("handler not found")
 	}
 
@@ -128,6 +101,40 @@ func (r *DefaultRouter) Route(ctx core.ExecutionContext) (core.HandlerMeta, erro
 	}
 
 	return *node.meta, nil
+}
+
+func findRoute(node *routeNode, segments []string, index int, params map[string]string) (*routeNode, map[string]string, bool) {
+	if index == len(segments) {
+		if node.meta == nil {
+			return nil, nil, false
+		}
+		return node, params, true
+	}
+
+	segment := segments[index]
+	if node.staticChildren != nil {
+		if child := node.staticChildren[segment]; child != nil {
+			if matched, matchedParams, ok := findRoute(child, segments, index+1, params); ok {
+				return matched, matchedParams, true
+			}
+		}
+	}
+
+	if node.paramChild == nil {
+		return nil, nil, false
+	}
+
+	branchParams := cloneParams(params, len(segments))
+	branchParams[node.paramChild.paramKey] = segment
+	return findRoute(node.paramChild, segments, index+1, branchParams)
+}
+
+func cloneParams(params map[string]string, capacity int) map[string]string {
+	cloned := make(map[string]string, capacity)
+	for key, value := range params {
+		cloned[key] = value
+	}
+	return cloned
 }
 
 func matchPath(pattern string, path string) (bool, map[string]string, []string) {

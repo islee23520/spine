@@ -21,6 +21,11 @@ type buildState struct {
 	err      error
 }
 
+type provider struct {
+	typeKey     reflect.Type
+	constructor reflect.Value
+}
+
 func New() *Container {
 	return &Container{
 		constructors: make(map[reflect.Type]reflect.Value),
@@ -31,10 +36,16 @@ func New() *Container {
 
 func (c *Container) RegisterConstructor(function any) error {
 	val := reflect.ValueOf(function)
+	if !val.IsValid() {
+		return errors.New("constructor must not be nil")
+	}
 	typ := val.Type()
 
 	if typ.Kind() != reflect.Func {
 		return errors.New("constructor must be a function")
+	}
+	if val.IsNil() {
+		return errors.New("constructor must not be nil")
 	}
 
 	if typ.NumOut() != 1 {
@@ -51,8 +62,8 @@ func (c *Container) RegisterConstructor(function any) error {
 }
 
 func (c *Container) Resolve(componentType reflect.Type) (any, error) {
-	if instance, ok := c.getInstance(componentType); ok {
-		return instance, nil
+	if componentType == nil {
+		return nil, errors.New("component type must not be nil")
 	}
 	if err := c.validateDependencyGraph(componentType, map[reflect.Type]int{}, nil, map[reflect.Type]struct{}{}); err != nil {
 		return nil, err
@@ -66,53 +77,55 @@ func (c *Container) validateDependencyGraph(
 	path []reflect.Type,
 	validated map[reflect.Type]struct{},
 ) error {
-	if _, ok := c.getInstance(componentType); ok {
-		return nil
-	}
-	if _, ok := validated[componentType]; ok {
-		return nil
-	}
-	if idx, ok := stack[componentType]; ok {
-		cycle := append([]reflect.Type{}, path[idx:]...)
-		cycle = append(cycle, componentType)
-		return fmt.Errorf("circular dependency detected: %s", formatTypePath(cycle))
-	}
-
-	constructor, err := c.getConstructor(componentType)
+	provider, err := c.getProvider(componentType)
 	if err != nil {
 		return err
 	}
+	providerType := provider.typeKey
 
-	stack[componentType] = len(path)
-	path = append(path, componentType)
-	defer delete(stack, componentType)
+	if _, ok := c.getInstance(providerType); ok {
+		return nil
+	}
+	if _, ok := validated[providerType]; ok {
+		return nil
+	}
+	if idx, ok := stack[providerType]; ok {
+		cycle := append([]reflect.Type{}, path[idx:]...)
+		cycle = append(cycle, providerType)
+		return fmt.Errorf("circular dependency detected: %s", formatTypePath(cycle))
+	}
 
-	for i := 0; i < constructor.Type().NumIn(); i++ {
-		if err := c.validateDependencyGraph(constructor.Type().In(i), stack, path, validated); err != nil {
+	stack[providerType] = len(path)
+	path = append(path, providerType)
+	defer delete(stack, providerType)
+
+	for i := 0; i < provider.constructor.Type().NumIn(); i++ {
+		if err := c.validateDependencyGraph(provider.constructor.Type().In(i), stack, path, validated); err != nil {
 			return err
 		}
 	}
-	validated[componentType] = struct{}{}
+	validated[providerType] = struct{}{}
 	return nil
 }
 
 func (c *Container) resolve(componentType reflect.Type, stack map[reflect.Type]int, path []reflect.Type) (any, error) {
-	if idx, ok := stack[componentType]; ok {
-		cycle := append([]reflect.Type{}, path[idx:]...)
-		cycle = append(cycle, componentType)
-		return nil, fmt.Errorf("circular dependency detected: %s", formatTypePath(cycle))
-	}
-
-	if instance, ok := c.getInstance(componentType); ok {
-		return instance, nil
-	}
-
-	constructor, err := c.getConstructor(componentType)
+	provider, err := c.getProvider(componentType)
 	if err != nil {
 		return nil, err
 	}
+	providerType := provider.typeKey
 
-	state, wait, ok := c.beginBuild(componentType)
+	if idx, ok := stack[providerType]; ok {
+		cycle := append([]reflect.Type{}, path[idx:]...)
+		cycle = append(cycle, providerType)
+		return nil, fmt.Errorf("circular dependency detected: %s", formatTypePath(cycle))
+	}
+
+	if instance, ok := c.getInstance(providerType); ok {
+		return instance, nil
+	}
+
+	state, wait, ok := c.beginBuild(providerType)
 	if !ok {
 		return state.instance, state.err
 	}
@@ -122,30 +135,35 @@ func (c *Container) resolve(componentType reflect.Type, stack map[reflect.Type]i
 			return state.instance, state.err
 		}
 	}
-	defer c.finishBuild(componentType, state)
+	defer c.finishBuild(providerType, state)
 
-	stack[componentType] = len(path)
-	path = append(path, componentType)
-	defer delete(stack, componentType)
+	stack[providerType] = len(path)
+	path = append(path, providerType)
+	defer delete(stack, providerType)
 
-	numIn := constructor.Type().NumIn()
+	numIn := provider.constructor.Type().NumIn()
 	args := make([]reflect.Value, numIn)
 	for i := 0; i < numIn; i++ {
-		paramType := constructor.Type().In(i)
+		paramType := provider.constructor.Type().In(i)
 		paramInstance, err := c.resolve(paramType, stack, path)
 		if err != nil {
 			state.err = err
 			return nil, err
 		}
-		args[i] = reflect.ValueOf(paramInstance)
+		arg, err := valueForType(paramInstance, paramType)
+		if err != nil {
+			state.err = fmt.Errorf("invalid dependency %d for %v: %w", i, providerType, err)
+			return nil, state.err
+		}
+		args[i] = arg
 	}
 
-	result, err := callConstructor(constructor, args)
+	result, err := callConstructor(provider.constructor, args)
 	if err != nil {
 		state.err = err
 		return nil, err
 	}
-	if cached, existed := c.cacheInstance(componentType, result); existed {
+	if cached, existed := c.cacheInstance(providerType, result); existed {
 		state.instance = cached
 		return cached, nil
 	}
@@ -165,7 +183,41 @@ func callConstructor(constructor reflect.Value, args []reflect.Value) (result an
 		}
 	}()
 
-	return constructor.Call(args)[0].Interface(), nil
+	value := constructor.Call(args)[0]
+	if isNilValue(value) {
+		return nil, fmt.Errorf("constructor for %v returned nil", constructor.Type().Out(0))
+	}
+	return value.Interface(), nil
+}
+
+func valueForType(value any, target reflect.Type) (reflect.Value, error) {
+	if value == nil {
+		return reflect.Value{}, fmt.Errorf("nil is not a valid value for %v", target)
+	}
+
+	reflected := reflect.ValueOf(value)
+	if isNilValue(reflected) {
+		return reflect.Value{}, fmt.Errorf("typed nil %v is not a valid value for %v", reflected.Type(), target)
+	}
+	if reflected.Type().AssignableTo(target) {
+		return reflected, nil
+	}
+	if reflected.Type().ConvertibleTo(target) {
+		return reflected.Convert(target), nil
+	}
+	return reflect.Value{}, fmt.Errorf("value of type %v is not assignable to %v", reflected.Type(), target)
+}
+
+func isNilValue(value reflect.Value) bool {
+	if !value.IsValid() {
+		return true
+	}
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Ptr:
+		return value.IsNil()
+	default:
+		return false
+	}
 }
 
 func (c *Container) getInstance(componentType reflect.Type) (any, bool) {
@@ -175,22 +227,22 @@ func (c *Container) getInstance(componentType reflect.Type) (any, bool) {
 	return instance, ok
 }
 
-func (c *Container) getConstructor(componentType reflect.Type) (reflect.Value, error) {
+func (c *Container) getProvider(componentType reflect.Type) (provider, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
 	// 정확한 타입 일치하는 생성자 우선 탐색
 	if v, ok := c.constructors[componentType]; ok {
-		return v, nil
+		return provider{typeKey: componentType, constructor: v}, nil
 	}
 
 	// 인터페이스 타입인 경우, 할당 가능한 생성자 탐색
 	if componentType.Kind() == reflect.Interface {
-		var matched reflect.Value
+		var matched provider
 		matches := 0
 		for outType, v := range c.constructors {
 			if outType.AssignableTo(componentType) {
-				matched = v
+				matched = provider{typeKey: outType, constructor: v}
 				matches++
 			}
 		}
@@ -198,11 +250,11 @@ func (c *Container) getConstructor(componentType reflect.Type) (reflect.Value, e
 			return matched, nil
 		}
 		if matches > 1 {
-			return reflect.Value{}, fmt.Errorf("multiple constructors registered for interface %v", componentType)
+			return provider{}, fmt.Errorf("multiple constructors registered for interface %v", componentType)
 		}
 	}
 
-	return reflect.Value{}, fmt.Errorf("no constructor registered for %v", componentType)
+	return provider{}, fmt.Errorf("no constructor registered for %v", componentType)
 }
 
 func (c *Container) cacheInstance(componentType reflect.Type, instance any) (any, bool) {

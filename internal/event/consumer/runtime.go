@@ -21,12 +21,16 @@ type Runtime struct {
 	factory     runnerFactory
 	pipeline    *pipeline.Pipeline
 	lifecycleMu sync.Mutex
+	workers     sync.WaitGroup
 	started     bool
 	stopped     bool
 	stopOnce    sync.Once
+	doneOnce    sync.Once
 	cancel      context.CancelFunc
 	errChan     chan error
 	done        chan struct{}
+	waitRetry   func(context.Context, time.Duration) bool
+	jitterDelay func(time.Duration, float64) time.Duration
 }
 
 const (
@@ -46,6 +50,10 @@ type TransportRetryPolicy struct {
 
 type retryPolicyProvider interface {
 	ConsumerRetryPolicy() TransportRetryPolicy
+}
+
+type startupValidator interface {
+	ValidateStartup(context.Context, Registration) error
 }
 
 func NewTransportRetryPolicy(initialDelay, maxDelay time.Duration, multiplier, jitter float64, maxAttempts int) TransportRetryPolicy {
@@ -83,11 +91,13 @@ func NewRuntime(registry *Registry, factory runnerFactory, pipeline *pipeline.Pi
 	}
 
 	return &Runtime{
-		registry: registry,
-		factory:  factory,
-		pipeline: pipeline,
-		errChan:  make(chan error, max(1, len(registry.Registrations()))),
-		done:     make(chan struct{}),
+		registry:    registry,
+		factory:     factory,
+		pipeline:    pipeline,
+		errChan:     make(chan error, max(1, len(registry.Registrations()))),
+		done:        make(chan struct{}),
+		waitRetry:   waitForRetry,
+		jitterDelay: jitteredDelay,
 	}
 }
 
@@ -118,32 +128,21 @@ func (r *Runtime) Start(ctx context.Context) {
 	}
 	ctx, r.cancel = context.WithCancel(ctx)
 	r.started = true
-	for _, registration := range r.registry.Registrations() {
+	registrations := r.registry.Registrations()
+	r.workers.Add(len(registrations))
+	for _, registration := range registrations {
 		log.Printf("[Event Consumer] Starting consumer for topic '%s'", registration.Topic)
 		go func(reg Registration) {
+			defer r.workers.Done()
 			select {
 			case <-ctx.Done():
 				return
 			default:
 			}
 
-			reader, err := r.factory.Build(reg)
-			if err == nil && reader == nil {
-				err = errors.New("consumer factory returned a nil reader")
-			}
-			if err != nil {
-				startErr := fmt.Errorf(
-					"[Event Consumer] Consumer initialization failed (topic=%s): %w",
-					reg.Topic,
-					err,
-				)
-				select {
-				case r.errChan <- startErr:
-				default:
-					log.Printf("%v (could not forward because the error channel is full)", startErr)
-				}
-				// 초기화 실패는 치명적이므로 전체 런타임을 중단한다.
-				r.Stop()
+			retryPolicy := r.retryPolicy()
+			reader, ok := r.acquireReader(ctx, reg, retryPolicy, nil, true, "initialization")
+			if !ok {
 				return
 			}
 			defer func() {
@@ -152,9 +151,6 @@ func (r *Runtime) Start(ctx context.Context) {
 				}
 			}()
 
-			retryPolicy := r.retryPolicy()
-			readRetryDelay := retryPolicy.InitialDelay
-			retryAttempts := 0
 			for {
 				select {
 				case <-ctx.Done():
@@ -168,37 +164,12 @@ func (r *Runtime) Start(ctx context.Context) {
 						log.Printf("[Event Consumer] Transport read failed (topic=%s): %v", reg.Topic, err)
 						_ = reader.Close()
 						reader = nil
-
-						for reader == nil {
-							retryAttempts++
-							if retryPolicy.MaxAttempts > 0 && retryAttempts > retryPolicy.MaxAttempts {
-								runtimeErr := fmt.Errorf("[Event Consumer] Transport reconnect attempts exhausted (topic=%s attempts=%d): %w", reg.Topic, retryPolicy.MaxAttempts, err)
-								r.forwardError(runtimeErr)
-								r.Stop()
-								return
-							}
-							if !waitForRetry(ctx, jitteredDelay(readRetryDelay, retryPolicy.Jitter)) {
-								return
-							}
-							candidate, buildErr := r.factory.Build(reg)
-							readRetryDelay = nextRetryDelay(readRetryDelay, retryPolicy)
-							if buildErr != nil || candidate == nil {
-								if candidate != nil {
-									_ = candidate.Close()
-								}
-								if buildErr == nil {
-									buildErr = errors.New("consumer factory returned a nil reader")
-								}
-								err = buildErr
-								log.Printf("[Event Consumer] Transport reconnect failed (topic=%s attempt=%d): %v", reg.Topic, retryAttempts, err)
-								continue
-							}
-							reader = candidate
+						reader, ok = r.acquireReader(ctx, reg, retryPolicy, err, false, "reconnect")
+						if !ok {
+							return
 						}
 						continue
 					}
-					readRetryDelay = retryPolicy.InitialDelay
-					retryAttempts = 0
 
 					// 컨슈머 실행 컨텍스트 생성
 					reqCtx := NewRequestContext(ctx, msg, nil)
@@ -212,11 +183,23 @@ func (r *Runtime) Start(ctx context.Context) {
 						)
 						// 핸들러 실패 시 NACK
 						if nackErr := msg.Nack(); nackErr != nil {
-							log.Printf(
-								"[Event Consumer] NACK failed (%s): %v",
-								reg.Topic,
-								nackErr,
-							)
+							if !errors.Is(nackErr, ErrReaderInvalidated) {
+								log.Printf(
+									"[Event Consumer] NACK failed (%s): %v",
+									reg.Topic,
+									nackErr,
+								)
+							}
+							_ = reader.Close()
+							reader = nil
+							// 실패한 전달을 다시 읽기 위해 reader를 폐기한 경우에도 즉시
+							// 재생성하지 않습니다. 영구적으로 실패하는 메시지가 consumer group
+							// 재가입과 같은 offset 재처리를 무제한으로 빠르게 반복하지 않도록
+							// 전송 재시도 정책의 backoff를 먼저 적용합니다.
+							reader, ok = r.acquireReader(ctx, reg, retryPolicy, nackErr, false, "reconnect")
+							if !ok {
+								return
+							}
 						}
 						continue
 					}
@@ -228,12 +211,78 @@ func (r *Runtime) Start(ctx context.Context) {
 							reg.Topic,
 							ackErr,
 						)
+						_ = reader.Close()
+						reader = nil
+						// ACK 실패도 같은 offset을 다시 읽게 되므로 즉시 재가입하지 않고
+						// 동일한 backoff 경계를 적용합니다.
+						reader, ok = r.acquireReader(ctx, reg, retryPolicy, ackErr, false, "reconnect")
+						if !ok {
+							return
+						}
 					}
 				}
 			}
 		}(registration)
 	}
 	r.lifecycleMu.Unlock()
+	go func() {
+		r.workers.Wait()
+		r.finish()
+	}()
+}
+
+func (r *Runtime) acquireReader(
+	ctx context.Context,
+	reg Registration,
+	policy TransportRetryPolicy,
+	lastErr error,
+	buildImmediately bool,
+	stage string,
+) (Reader, bool) {
+	select {
+	case <-ctx.Done():
+		return nil, false
+	default:
+	}
+	if buildImmediately {
+		reader, err := r.buildReader(reg)
+		if err == nil {
+			return reader, true
+		}
+		lastErr = err
+		log.Printf("[Event Consumer] Transport %s failed (topic=%s): %v", stage, reg.Topic, err)
+	}
+
+	delay := policy.InitialDelay
+	for attempts := 1; ; attempts++ {
+		if policy.MaxAttempts > 0 && attempts > policy.MaxAttempts {
+			runtimeErr := fmt.Errorf("[Event Consumer] Transport %s attempts exhausted (topic=%s attempts=%d): %w", stage, reg.Topic, policy.MaxAttempts, lastErr)
+			r.forwardError(runtimeErr)
+			r.initiateStop()
+			return nil, false
+		}
+		if !r.waitRetry(ctx, r.jitterDelay(delay, policy.Jitter)) {
+			return nil, false
+		}
+		reader, err := r.buildReader(reg)
+		delay = nextRetryDelay(delay, policy)
+		if err == nil {
+			return reader, true
+		}
+		lastErr = err
+		log.Printf("[Event Consumer] Transport %s failed (topic=%s attempt=%d): %v", stage, reg.Topic, attempts, err)
+	}
+}
+
+func (r *Runtime) buildReader(reg Registration) (Reader, error) {
+	reader, err := r.factory.Build(reg)
+	if err == nil && reader == nil {
+		err = errors.New("consumer factory returned a nil reader")
+	}
+	if err != nil && reader != nil {
+		_ = reader.Close()
+	}
+	return reader, err
 }
 
 func (r *Runtime) forwardError(err error) {
@@ -272,12 +321,9 @@ func waitForRetry(ctx context.Context, delay time.Duration) bool {
 
 func (r *Runtime) Validate() error {
 	for _, reg := range r.registry.Registrations() {
-		reader, err := r.factory.Build(reg)
+		reader, err := r.buildValidationReader(context.Background(), reg)
 		if err != nil {
 			return fmt.Errorf("Consumer initialization failed (%s): %w", reg.Topic, err)
-		}
-		if reader == nil {
-			return fmt.Errorf("Consumer initialization failed (%s): %w", reg.Topic, errors.New("consumer factory returned a nil reader"))
 		}
 		if err := reader.Close(); err != nil {
 			return fmt.Errorf("Consumer shutdown failed (%s): %w", reg.Topic, err)
@@ -286,7 +332,53 @@ func (r *Runtime) Validate() error {
 	return nil
 }
 
+// ValidateWithRetry verifies that every configured reader can be created before
+// an ingress listener is exposed. Unlike Validate, transient build failures use
+// the configured ConsumerRetry policy and can be interrupted by ctx.
+func (r *Runtime) ValidateWithRetry(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	policy := r.retryPolicy()
+	for _, reg := range r.registry.Registrations() {
+		reader, err := r.buildValidationReader(ctx, reg)
+		delay := policy.InitialDelay
+		for retries := 1; err != nil; retries++ {
+			if policy.MaxAttempts > 0 && retries > policy.MaxAttempts {
+				return fmt.Errorf("Consumer initialization retries exhausted (%s retries=%d): %w", reg.Topic, policy.MaxAttempts, err)
+			}
+			if !r.waitRetry(ctx, r.jitterDelay(delay, policy.Jitter)) {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return fmt.Errorf("Consumer initialization canceled (%s): %w", reg.Topic, ctxErr)
+				}
+				return fmt.Errorf("Consumer initialization retry interrupted (%s): %w", reg.Topic, err)
+			}
+			reader, err = r.buildValidationReader(ctx, reg)
+			delay = nextRetryDelay(delay, policy)
+		}
+		if err := reader.Close(); err != nil {
+			return fmt.Errorf("Consumer shutdown failed (%s): %w", reg.Topic, err)
+		}
+	}
+	return nil
+}
+
+func (r *Runtime) buildValidationReader(ctx context.Context, reg Registration) (Reader, error) {
+	if validator, ok := r.factory.(startupValidator); ok {
+		if err := validator.ValidateStartup(ctx, reg); err != nil {
+			return nil, err
+		}
+	}
+	return r.buildReader(reg)
+}
+
 func (r *Runtime) Stop() {
+	r.initiateStop()
+	r.workers.Wait()
+	r.finish()
+}
+
+func (r *Runtime) initiateStop() {
 	r.stopOnce.Do(func() {
 		r.lifecycleMu.Lock()
 		r.stopped = true
@@ -295,6 +387,14 @@ func (r *Runtime) Stop() {
 		if cancel != nil {
 			cancel() // 모든 goroutine 중지
 		}
+	})
+}
+
+func (r *Runtime) finish() {
+	r.doneOnce.Do(func() {
+		r.lifecycleMu.Lock()
+		r.stopped = true
+		r.lifecycleMu.Unlock()
 		close(r.done)
 		log.Printf("[Event Consumer] All consumers stopped")
 	})

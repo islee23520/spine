@@ -28,6 +28,7 @@ func (f *RunnerFactory) Build(registration consumer.Registration) (consumer.Read
 			Queue:          registration.Topic,
 			Exchange:       f.opts.Read.Exchange,
 			RoutingKey:     registration.Topic,
+			PrefetchCount:  f.opts.Read.EffectivePrefetchCount(),
 			FailurePolicy:  RabbitMqFailurePolicy(f.opts.Read.EffectiveFailurePolicy()),
 			DeadLetter:     deadLetter,
 			RequeueOnError: f.opts.Read.RequeueOnError,

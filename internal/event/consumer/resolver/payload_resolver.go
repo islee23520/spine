@@ -26,5 +26,9 @@ func (r *PayloadResolver) Resolve(ctx core.ExecutionContext, meta resolver.Param
 		return nil, fmt.Errorf("Payload not found in RequestContext")
 	}
 
-	return payload, nil
+	value := reflect.ValueOf(payload)
+	if !value.Type().ConvertibleTo(meta.Type) {
+		return nil, fmt.Errorf("payload type %v is not convertible to %v", value.Type(), meta.Type)
+	}
+	return value.Convert(meta.Type).Interface(), nil
 }

@@ -3,6 +3,7 @@ package publish
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -189,5 +190,62 @@ func TestDefaultEventDispatcher_PassesCancellationAndJoinsPublisherErrors(t *tes
 	}
 	if !secondPublisherSawCanceledContext.Load() {
 		t.Fatal("취소된 context가 publisher에 전달되어야 합니다")
+	}
+}
+
+func TestDefaultEventDispatcher_RecoversPublisherPanicsAndReturnsInRegistrationOrder(t *testing.T) {
+	firstPanic := errors.New("first panic")
+	dispatcher, err := NewDefaultEventDispatcher(
+		&funcPublisher{publish: func(context.Context, pkgevent.DomainEvent) error {
+			panic(firstPanic)
+		}},
+		&funcPublisher{publish: func(context.Context, pkgevent.DomainEvent) error {
+			panic("second panic")
+		}},
+		&testPublisher{},
+	)
+	if err != nil {
+		t.Fatalf("dispatcher 생성 실패: %v", err)
+	}
+
+	err = dispatcher.Dispatch(context.Background(), []pkgevent.DomainEvent{
+		testDomainEvent{name: "order.created", at: time.Now()},
+	})
+	if err == nil {
+		t.Fatal("publisher panics must become dispatch errors")
+	}
+	if !errors.Is(err, firstPanic) {
+		t.Fatalf("panic error identity must be preserved: %v", err)
+	}
+	text := err.Error()
+	firstIndex := strings.Index(text, "publisher[0]")
+	secondIndex := strings.Index(text, "publisher[1]")
+	if firstIndex < 0 || secondIndex < 0 || firstIndex >= secondIndex {
+		t.Fatalf("panic errors must be joined in publisher registration order: %v", err)
+	}
+}
+
+func TestDefaultEventDispatcher_ContinuesOtherPublishersAfterPanic(t *testing.T) {
+	var healthyCalls atomic.Int32
+	dispatcher, err := NewDefaultEventDispatcher(
+		&funcPublisher{publish: func(context.Context, pkgevent.DomainEvent) error {
+			panic("boom")
+		}},
+		&funcPublisher{publish: func(context.Context, pkgevent.DomainEvent) error {
+			healthyCalls.Add(1)
+			return nil
+		}},
+	)
+	if err != nil {
+		t.Fatalf("dispatcher 생성 실패: %v", err)
+	}
+
+	if err := dispatcher.Dispatch(context.Background(), []pkgevent.DomainEvent{
+		testDomainEvent{name: "order.created", at: time.Now()},
+	}); err == nil {
+		t.Fatal("recovered panic must be returned")
+	}
+	if healthyCalls.Load() != 1 {
+		t.Fatalf("healthy publishers must still run, calls=%d", healthyCalls.Load())
 	}
 }

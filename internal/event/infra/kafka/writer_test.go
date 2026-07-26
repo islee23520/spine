@@ -82,6 +82,19 @@ func TestNewKafkaPublisher_RequiresWriteOptions(t *testing.T) {
 	}
 }
 
+func TestNewKafkaPublisher_RequiresAllAcknowledgements(t *testing.T) {
+	publisher, err := NewKafkaPublisher(&boot.KafkaOptions{
+		Brokers: []string{"localhost:9092"},
+		Write:   &boot.KafkaWriteOptions{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if publisher.Writer.RequiredAcks != kafka.RequireAll {
+		t.Fatalf("publisher must require all in-sync replicas, got %v", publisher.Writer.RequiredAcks)
+	}
+}
+
 func TestNewKafkaPublisher_UsesImplicitSecureTransportByDefault(t *testing.T) {
 	publisher, err := NewKafkaPublisher(&boot.KafkaOptions{
 		Brokers: []string{"localhost:9092"},

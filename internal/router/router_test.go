@@ -145,6 +145,25 @@ func TestRouter_RouteRequiresMethodAndPathMatch(t *testing.T) {
 	}
 }
 
+func TestRouter_BacktracksFromStaticDeadEndToParameterRoute(t *testing.T) {
+	r := NewRouter()
+	r.Register("GET", "/files/static/metadata", testHandlerMeta("List"))
+	r.Register("GET", "/files/:name/download", testHandlerMeta("Create"))
+
+	ctx := newTestExecutionContext("GET", "/files/static/download")
+	got, err := r.Route(ctx)
+	if err != nil {
+		t.Fatalf("정적 분기의 dead-end 뒤 parameter route로 backtrack해야 합니다: %v", err)
+	}
+	if got.Method.Name != "Create" {
+		t.Fatalf("parameter route가 선택되어야 합니다: %s", got.Method.Name)
+	}
+	paramsAny, ok := ctx.Get("spine.params")
+	if !ok || paramsAny.(map[string]string)["name"] != "static" {
+		t.Fatalf("backtrack한 parameter 값이 보존되어야 합니다: %#v", paramsAny)
+	}
+}
+
 func TestRouter_ControllerTypesDeduplicatesControllers(t *testing.T) {
 	r := NewRouter()
 	r.Register("GET", "/one", testHandlerMeta("List"))

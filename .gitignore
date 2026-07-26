@@ -32,6 +32,8 @@ docs/*
 docs/migration/*
 !docs/migration/v0.5.md
 !docs/migration/v0.5.en.md
+!docs/migration/v0.5.1.md
+!docs/migration/v0.5.1.en.md
 !docs/security-configuration.md
 !docs/security-configuration.en.md
 

@@ -9,6 +9,10 @@ Use the current Spine source code and tests as the only API authority. In partic
 - Return `httpx.Response[T]` for successful HTTP responses and `httperr.*` errors for expected HTTP failures.
 - Check errors from `WebSocket().Register`, `Consumers().Register`, and `Run`.
 - Enable HTTP explicitly with `HTTP: &boot.HTTPOptions{}`. Without it, the current runtime does not start an HTTP server.
+- Use `App.Validate(options)` in deployment checks. It reports all network-free configuration problems as `*boot.ConfigError`; `Run` performs the same preflight before opening listeners or connecting to brokers.
+- Treat Kafka and RabbitMQ delivery as at least once: make consumers idempotent, and use an outbox when a database commit and an external publish must behave as one durable operation.
+- Keep broker transports secure by default. Kafka requires TLS unless a custom transport is supplied, and RabbitMQ requires `amqps://`; insecure compatibility flags are for isolated local development only.
+- Scope global interceptors with `InterceptorFor(boot.InterceptorHTTP|boot.InterceptorWebSocket|boot.InterceptorAll, ...)` when a policy does not apply to both HTTP and WebSocket traffic.
 
 The examples require Go `1.25.5` or later and the module:
 
@@ -54,10 +58,14 @@ func main() {
 	app.Constructor(NewHealthController)
 	app.Route("GET", "/health/:id", (*HealthController).Get)
 
-	if err := app.Run(boot.Options{
+	opts := boot.Options{
 		Address: ":8080",
 		HTTP:    &boot.HTTPOptions{},
-	}); err != nil {
+	}
+	if err := app.Validate(opts); err != nil {
+		log.Fatal(err)
+	}
+	if err := app.Run(opts); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -70,7 +78,7 @@ go run .
 curl http://localhost:8080/health/42
 ```
 
-The `path.Int` parameter is resolved from `:id`; access the parsed value through `id.Value`.
+The `path.Int` parameter is resolved from `:id`; access the parsed value through `id.Value`. Calling `Validate` separately is useful in CI and deployment checks; it does not open a network connection. `Run` repeats that validation and does not open the HTTP listener until dependency warm-up and enabled broker readiness checks succeed.
 
 ## 2. CRUD + DI + error handling
 
@@ -212,6 +220,8 @@ curl -i http://localhost:8080/users/999
 
 Expected failure responses are returned through `httperr.BadRequest` and `httperr.NotFound`; Spine serializes them as JSON with a `message` field.
 
+DI constructors and their returned providers must be non-nil. A provider resolved through its concrete type and through an implemented interface shares one singleton. A successful HTTP response is serialized and its cookies and status are validated before `BeforeResponse` runs, so a transaction interceptor can roll back on response-preparation failures. A physical socket write still cannot be atomic with a database commit.
+
 ## 3. WebSocket chat
 
 This application receives a JSON message on `/ws/chat` and broadcasts it to every connected client. Create `main.go`:
@@ -313,7 +323,12 @@ func main() {
 
 	if err := app.Run(boot.Options{
 		Address: ":8080",
-		HTTP:    &boot.HTTPOptions{},
+		HTTP: &boot.HTTPOptions{
+			WebSocket: boot.WebSocketOptions{
+				AllowedOrigins: []string{"http://localhost:3000"},
+				MaxConnections: 256,
+			},
+		},
 	}); err != nil {
 		log.Fatal(err)
 	}
@@ -328,11 +343,28 @@ Run two WebSocket clients against `ws://localhost:8080/ws/chat`, then send:
 
 Each connected client receives a JSON `ChatEvent`. `ws.ConnectionID` identifies the sender, and `ws.Sender` is obtained from the request context using `ws.SenderKey`.
 
+An empty `AllowedOrigins` uses same-origin checks; production browser clients should normally use exact origins. The default connection limit is `boot.DefaultWebSocketMaxConnections` (1024), and capacity rejection returns HTTP 503 with the `WEBSOCKET_CAPACITY_EXCEEDED` code. For authentication before upgrade, register an interceptor for `boot.InterceptorWebSocket` and additionally implement:
+
+```go
+func (i *AuthInterceptor) PreHandshake(
+	ctx core.WebSocketHandshakeContext,
+	meta core.HandlerMeta,
+) error {
+	token := ctx.Header("Authorization")
+	if token == "" {
+		return httperr.Unauthorized("missing credentials")
+	}
+	return i.verify(token)
+}
+```
+
+`PreHandshake` runs before the HTTP upgrade. Message-level `PreHandle` keeps running once per message. `core.WebSocketMessageContext` also exposes an immutable snapshot of handshake headers, query values, cookies, remote address, host, and request URI.
+
 ## 4. Kafka event publishing and consumption
 
 Use two applications with a shared event type. The order application publishes `order.created`; the stock application consumes it.
 
-Assume the module path is `example.com/spine-kafka` and Kafka is available at `localhost:9092`.
+Assume the module path is `example.com/spine-kafka` and a plaintext development-only Kafka broker is available at `localhost:9092`. Spine requires TLS by default; the local examples below opt in to insecure transport explicitly. Production deployments should configure `KafkaOptions.TLS` instead.
 
 Create `shared/events/order_created.go`:
 
@@ -403,6 +435,7 @@ func main() {
 		Address: ":8080",
 		Kafka: &boot.KafkaOptions{
 			Brokers: []string{"localhost:9092"},
+			AllowInsecureTransport: true, // isolated local development only
 			Write:   &boot.KafkaWriteOptions{},
 		},
 		HTTP: &boot.HTTPOptions{},
@@ -455,6 +488,7 @@ func main() {
 	if err := app.Run(boot.Options{
 		Kafka: &boot.KafkaOptions{
 			Brokers: []string{"localhost:9092"},
+			AllowInsecureTransport: true, // isolated local development only
 			Read: &boot.KafkaReadOptions{
 				GroupID: "stock-service",
 			},
@@ -471,4 +505,6 @@ Start `stock-app` before `order-app`, then call:
 curl -i -X POST http://localhost:8080/orders/123
 ```
 
-`publish.Event` queues events on the request context. Spine dispatches them only after the controller finishes successfully, using the configured Kafka publisher. The consumer handler receives `context.Context`, the event name, and the DTO decoded from the Kafka message.
+`publish.Event` queues events on the request context. Spine dispatches them only after the controller succeeds and the HTTP response passes serialization, cookie, and status validation, using the configured Kafka publisher. The consumer handler receives `context.Context`, the event name, and the DTO decoded from the Kafka message.
+
+Framework-managed Kafka writes require acknowledgements from all in-sync replicas. Consumption is still at least once: handlers must be idempotent, and a permanently failing record can block its partition because Spine does not automatically skip it or choose a dead-letter policy. Reader creation and reconstruction after failed ACK/NACK use `KafkaOptions.ConsumerRetry`; shutdown waits for active handlers, ACK/NACK work, and readers to drain.

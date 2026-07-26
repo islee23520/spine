@@ -2,6 +2,8 @@ package ws
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -11,8 +13,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/NARUBROWN/spine/core"
 	"github.com/NARUBROWN/spine/internal/pipeline"
 	"github.com/NARUBROWN/spine/pkg/boot"
+	"github.com/NARUBROWN/spine/pkg/httperr"
 	"github.com/gorilla/websocket"
 )
 
@@ -43,12 +47,18 @@ type Runtime struct {
 	stopOnce sync.Once
 	ctx      context.Context
 	cancel   context.CancelFunc
-	connMu   sync.Mutex
-	conns    map[string]*trackedConn
+	// lifecycleMu는 HandleConn 등록과 Stop의 대기 시작을 직렬화합니다.
+	// Stop이 시작된 뒤에는 WaitGroup에 새로운 작업이 추가되지 않습니다.
+	lifecycleMu sync.Mutex
+	stopping    bool
+	handlers    sync.WaitGroup
+	connMu      sync.Mutex
+	conns       map[string]*trackedConn
 	// connectionSlots는 활성 연결과 진행 중인 핸드셰이크를 모두 포함합니다.
 	// 동시에 여러 핸드셰이크가 진행되어도 최대 연결 수를 넘지 않도록
 	// 연결을 업그레이드하기 전에 슬롯을 미리 확보합니다.
-	connectionSlots int
+	connectionSlots       int
+	handshakeInterceptors []core.WebSocketHandshakeInterceptor
 }
 
 type trackedConn struct {
@@ -76,7 +86,7 @@ func (c *trackedConn) writeControl(messageType int, data []byte, timeout time.Du
 	return c.conn.WriteControl(messageType, data, deadline)
 }
 
-func NewRuntime(registry *Registry, pipeline *pipeline.Pipeline, opts boot.WebSocketOptions) *Runtime {
+func NewRuntime(registry *Registry, pipeline *pipeline.Pipeline, opts boot.WebSocketOptions, handshakeInterceptors ...core.WebSocketHandshakeInterceptor) *Runtime {
 	if registry == nil {
 		panic("ws: registry cannot be nil")
 	}
@@ -87,12 +97,13 @@ func NewRuntime(registry *Registry, pipeline *pipeline.Pipeline, opts boot.WebSo
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return &Runtime{
-		registry: registry,
-		pipeline: pipeline,
-		options:  normalizeWebSocketOptions(opts),
-		ctx:      ctx,
-		cancel:   cancel,
-		conns:    make(map[string]*trackedConn),
+		registry:              registry,
+		pipeline:              pipeline,
+		options:               normalizeWebSocketOptions(opts),
+		ctx:                   ctx,
+		cancel:                cancel,
+		conns:                 make(map[string]*trackedConn),
+		handshakeInterceptors: append([]core.WebSocketHandshakeInterceptor(nil), handshakeInterceptors...),
 	}
 }
 
@@ -164,12 +175,11 @@ func (r *Runtime) Mount(mux *http.ServeMux) {
 }
 
 func (r *Runtime) HandleConn(w http.ResponseWriter, req *http.Request, reg Registration) {
-	select {
-	case <-r.ctx.Done():
+	if !r.beginHandleConn() {
 		http.Error(w, "websocket runtime is shutting down", http.StatusServiceUnavailable)
 		return
-	default:
 	}
+	defer r.handlers.Done()
 
 	reserved, slots := r.reserveConnectionSlot()
 	if !reserved {
@@ -198,6 +208,19 @@ func (r *Runtime) HandleConn(w http.ResponseWriter, req *http.Request, reg Regis
 			r.releaseConnectionSlot()
 		}
 	}()
+
+	handshakeCtx, cancelHandshake := context.WithCancel(req.Context())
+	stopHandshakeCancellation := context.AfterFunc(r.ctx, cancelHandshake)
+	defer func() {
+		stopHandshakeCancellation()
+		cancelHandshake()
+	}()
+	handshakeContext := newWebSocketRequestSnapshot(req.WithContext(handshakeCtx))
+	if err := r.preHandshake(handshakeContext, reg); err != nil {
+		writeHandshakeRejection(w, err)
+		log.Printf("[WS] Handshake rejected (path=%s): %v", reg.Path, err)
+		return
+	}
 
 	upgrader := r.upgrader()
 	conn, err := upgrader.Upgrade(w, req, nil)
@@ -274,6 +297,7 @@ func (r *Runtime) HandleConn(w http.ResponseWriter, req *http.Request, reg Regis
 			payload,
 			nil,
 			sendFn,
+			handshakeContext,
 		)
 
 		if err := r.pipeline.Execute(ctx); err != nil {
@@ -289,9 +313,51 @@ func (r *Runtime) HandleConn(w http.ResponseWriter, req *http.Request, reg Regis
 	}
 }
 
+func (r *Runtime) preHandshake(ctx core.WebSocketHandshakeContext, reg Registration) error {
+	for _, interceptor := range r.handshakeInterceptors {
+		if interceptor == nil {
+			continue
+		}
+		if err := callPreHandshake(interceptor, ctx, reg.Meta); err != nil {
+			return err
+		}
+	}
+	for _, interceptor := range reg.Meta.Interceptors {
+		handshakeInterceptor, ok := interceptor.(core.WebSocketHandshakeInterceptor)
+		if !ok {
+			continue
+		}
+		if err := callPreHandshake(handshakeInterceptor, ctx, reg.Meta); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func callPreHandshake(interceptor core.WebSocketHandshakeInterceptor, ctx core.WebSocketHandshakeContext, meta core.HandlerMeta) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("websocket handshake interceptor panic: %v", recovered)
+		}
+	}()
+	return interceptor.PreHandshake(ctx, meta)
+}
+
+func writeHandshakeRejection(w http.ResponseWriter, err error) {
+	status := http.StatusUnauthorized
+	var httpErr *httperr.HTTPError
+	if errors.As(err, &httpErr) && httpErr.Status >= 400 && httpErr.Status <= 499 {
+		status = httpErr.Status
+	}
+	http.Error(w, http.StatusText(status), status)
+}
+
 func (r *Runtime) Stop() {
 	r.stopOnce.Do(func() {
+		r.lifecycleMu.Lock()
+		r.stopping = true
 		r.cancel()
+		r.lifecycleMu.Unlock()
 
 		r.connMu.Lock()
 		conns := make(map[string]*trackedConn, len(r.conns))
@@ -309,8 +375,19 @@ func (r *Runtime) Stop() {
 			_ = conn.conn.Close()
 		}
 
+		r.handlers.Wait()
 		log.Printf("[WS] WebSocket runtime stopped")
 	})
+}
+
+func (r *Runtime) beginHandleConn() bool {
+	r.lifecycleMu.Lock()
+	defer r.lifecycleMu.Unlock()
+	if r.stopping {
+		return false
+	}
+	r.handlers.Add(1)
+	return true
 }
 
 func (r *Runtime) reserveConnectionSlot() (bool, int) {

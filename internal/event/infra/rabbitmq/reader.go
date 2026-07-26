@@ -28,6 +28,8 @@ type RabbitMqReadOptions struct {
 	Queue      string
 	Exchange   string
 	RoutingKey string
+	// PrefetchCount는 동시에 전달되는 미확인 메시지 수입니다. 0이면 기본값 1입니다.
+	PrefetchCount int
 	// RequeueOnError는 전달에 실패한 메시지를 다시 큐에 넣어 재시도합니다.
 	// 영구적으로 잘못된 메시지가 컨슈머에서 무한 반복되지 않도록 기본값은 비활성화입니다.
 	FailurePolicy  RabbitMqFailurePolicy
@@ -122,6 +124,12 @@ func NewRabbitMqReader(opts RabbitMqOptions) (*Reader, error) {
 		return nil, err
 	}
 
+	if err := applyConsumerQos(ch, effectivePrefetchCount(opts.Read)); err != nil {
+		_ = ch.Close()
+		_ = conn.Close()
+		return nil, fmt.Errorf("RabbitMQ consumer QoS setup failed: %w", err)
+	}
+
 	msgs, err := ch.Consume(
 		opts.Read.Queue,
 		"",
@@ -152,6 +160,9 @@ func validateReadOptions(opts *RabbitMqReadOptions) error {
 	if opts.RoutingKey == "" {
 		return errors.New("RabbitMQ read routing key cannot be empty")
 	}
+	if opts.PrefetchCount < 0 {
+		return errors.New("RabbitMQ prefetch count cannot be negative")
+	}
 	policy := effectiveFailurePolicy(opts)
 	if policy != RabbitMqFailureReject && policy != RabbitMqFailureRequeue {
 		return fmt.Errorf("RabbitMQ failure policy %q is invalid", policy)
@@ -163,6 +174,21 @@ func validateReadOptions(opts *RabbitMqReadOptions) error {
 		return errors.New("RabbitMQ dead-letter exchange cannot be empty")
 	}
 	return nil
+}
+
+type qosConfigurer interface {
+	Qos(prefetchCount, prefetchSize int, global bool) error
+}
+
+func effectivePrefetchCount(opts *RabbitMqReadOptions) int {
+	if opts.PrefetchCount == 0 {
+		return 1
+	}
+	return opts.PrefetchCount
+}
+
+func applyConsumerQos(channel qosConfigurer, prefetchCount int) error {
+	return channel.Qos(prefetchCount, 0, false)
 }
 
 func effectiveFailurePolicy(opts *RabbitMqReadOptions) RabbitMqFailurePolicy {

@@ -18,6 +18,20 @@ type fakeAcknowledger struct {
 	nackRequeue  bool
 }
 
+type fakeQosConfigurer struct {
+	prefetchCount int
+	prefetchSize  int
+	global        bool
+	err           error
+}
+
+func (q *fakeQosConfigurer) Qos(prefetchCount, prefetchSize int, global bool) error {
+	q.prefetchCount = prefetchCount
+	q.prefetchSize = prefetchSize
+	q.global = global
+	return q.err
+}
+
 func (a *fakeAcknowledger) Ack(tag uint64, multiple bool) error {
 	a.ackCalled = true
 	a.ackTag = tag
@@ -155,6 +169,34 @@ func TestValidateReadOptionsRequiresDerivedQueueAndRoutingKey(t *testing.T) {
 	}
 	if err := validateReadOptions(&RabbitMqReadOptions{Queue: "orders"}); err == nil || !strings.Contains(err.Error(), "routing key cannot be empty") {
 		t.Fatalf("empty routing key should fail before dialing: %v", err)
+	}
+}
+
+func TestRabbitMqReaderPrefetchDefaultsToOneAndAppliesPerConsumerQos(t *testing.T) {
+	if got := effectivePrefetchCount(&RabbitMqReadOptions{}); got != 1 {
+		t.Fatalf("zero prefetch must default to 1, got %d", got)
+	}
+	if got := effectivePrefetchCount(&RabbitMqReadOptions{PrefetchCount: 16}); got != 16 {
+		t.Fatalf("explicit prefetch must be preserved, got %d", got)
+	}
+
+	qos := &fakeQosConfigurer{}
+	if err := applyConsumerQos(qos, 16); err != nil {
+		t.Fatalf("QoS setup failed: %v", err)
+	}
+	if qos.prefetchCount != 16 || qos.prefetchSize != 0 || qos.global {
+		t.Fatalf("unexpected QoS arguments: %+v", qos)
+	}
+}
+
+func TestValidateReadOptionsRejectsNegativePrefetch(t *testing.T) {
+	err := validateReadOptions(&RabbitMqReadOptions{
+		Queue:         "orders",
+		RoutingKey:    "orders.created",
+		PrefetchCount: -1,
+	})
+	if err == nil || !strings.Contains(err.Error(), "prefetch count cannot be negative") {
+		t.Fatalf("negative prefetch must fail before dialing: %v", err)
 	}
 }
 

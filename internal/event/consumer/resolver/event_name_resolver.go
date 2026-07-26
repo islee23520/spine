@@ -25,5 +25,9 @@ func (r *EventNameResolver) Resolve(ctx core.ExecutionContext, meta resolver.Par
 		return nil, fmt.Errorf("EventName not found in RequestContext")
 	}
 
-	return name, nil
+	value := reflect.ValueOf(name)
+	if !value.Type().ConvertibleTo(meta.Type) {
+		return nil, fmt.Errorf("event name type %v is not convertible to %v", value.Type(), meta.Type)
+	}
+	return value.Convert(meta.Type).Interface(), nil
 }

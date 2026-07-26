@@ -54,6 +54,7 @@ func (p *Pipeline) Execute(ctx core.ExecutionContext) (finalErr error) {
 	var results []any
 	var returnedErr error
 	beforeResponseCalled := false
+	responseStage := stageResponseWriter(ctx)
 
 	// AfterCompletion은 응답 처리가 끝난 뒤 실행한다.
 	defer func() {
@@ -69,10 +70,32 @@ func (p *Pipeline) Execute(ctx core.ExecutionContext) (finalErr error) {
 		}
 	}()
 
+	// Error rendering runs before this deferred flush. AfterCompletion then sees
+	// the actual transport writer and any flush error in finalErr.
+	defer func() {
+		if responseStage == nil {
+			return
+		}
+		ctx.Set("spine.response_writer", responseStage.target)
+		if err := responseStage.flush(); err != nil {
+			finalErr = errors.Join(finalErr, fmt.Errorf("flush staged response: %w", err))
+			if !responseStage.target.IsCommitted() {
+				if fallbackErr := responseStage.target.WriteJSON(http.StatusInternalServerError, map[string]any{
+					"message": "Internal server error",
+				}); fallbackErr != nil {
+					finalErr = errors.Join(finalErr, fmt.Errorf("write fallback error response: %w", fallbackErr))
+				}
+			}
+		}
+	}()
+
 	// 실행 오류는 BeforeResponse가 끝난 뒤 HTTP 오류 응답으로 변환한다.
 	defer func() {
 		if finalErr == nil {
 			return
+		}
+		if responseStage != nil {
+			responseStage.rollbackSuccessResponse()
 		}
 
 		if returnedErr != nil {
@@ -156,20 +179,19 @@ func (p *Pipeline) Execute(ctx core.ExecutionContext) (finalErr error) {
 		return returnedErr
 	}
 
+	if responseStage != nil {
+		responseStage.checkpointSuccessResponse()
+	}
+	if err := p.handleSuccessReturn(ctx, results); err != nil {
+		return err
+	}
+
+	// 응답이 직렬화·쿠키·status 검증을 통과한 뒤에만 domain-event 후처리를
+	// 실행한다. 실제 transport flush는 BeforeResponse 이후까지 계속 지연된다.
 	for _, hook := range p.postHooks {
 		if err := hook.AfterExecution(ctx, results, nil); err != nil {
 			return err
 		}
-	}
-
-	finalErr = runBeforeResponse(ctx, globalMeta, routeFinalizers, globalFinalizers, nil)
-	beforeResponseCalled = true
-	if finalErr != nil {
-		return finalErr
-	}
-
-	if err := p.handleSuccessReturn(ctx, results); err != nil {
-		return err
 	}
 
 	// 라우트 인터셉터의 사후 처리 실행(역순)
@@ -180,6 +202,12 @@ func (p *Pipeline) Execute(ctx core.ExecutionContext) (finalErr error) {
 	// 전역 인터셉터의 사후 처리 실행(역순)
 	for i := len(p.interceptors) - 1; i >= 0; i-- {
 		p.interceptors[i].PostHandle(ctx, meta)
+	}
+
+	finalErr = runBeforeResponse(ctx, globalMeta, routeFinalizers, globalFinalizers, nil)
+	beforeResponseCalled = true
+	if finalErr != nil {
+		return finalErr
 	}
 
 	return nil
@@ -270,8 +298,7 @@ func callHandleExecutionError(
 			err = panicAsError(recovered)
 		}
 	}()
-	p.handleExecutionError(ctx, executionErr)
-	return nil
+	return p.handleExecutionError(ctx, executionErr)
 }
 
 func buildParameterMeta(method reflect.Method, pathKeys []string) []resolver.ParameterMeta {
@@ -412,50 +439,59 @@ func (p *Pipeline) AddPostExecutionHook(hook hook.PostExecutionHook) {
 	p.postHooks = append(p.postHooks, hook)
 }
 
-func (p *Pipeline) handleExecutionError(ctx core.ExecutionContext, err error) {
+func (p *Pipeline) handleExecutionError(ctx core.ExecutionContext, err error) error {
 	rwAny, ok := ctx.Get("spine.response_writer")
 	if !ok {
-		return
+		return nil
 	}
 
 	rw, ok := rwAny.(core.ResponseWriter)
 	if !ok {
-		return
+		return fmt.Errorf("invalid ResponseWriter type while rendering execution error")
 	}
 
 	// ReturnValueHandler 등에서 이미 응답이 커밋된 경우 이중 응답을 방지한다.
 	if rw.IsCommitted() {
-		return
+		return nil
 	}
 
+	status := http.StatusInternalServerError
+	message := "Internal server error"
+	var responseErr error
 	var httpErr *httperr.HTTPError
 	if errors.As(err, &httpErr) {
-		rw.WriteJSON(
-			httpErr.Status,
-			map[string]any{
-				"message": httpErr.Message,
-			},
-		)
-		return
+		if httpErr.Status < 400 || httpErr.Status > 599 {
+			responseErr = fmt.Errorf("invalid HTTP error status %d", httpErr.Status)
+		} else {
+			status = httpErr.Status
+			message = httpErr.Message
+		}
+	} else {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			status = http.StatusRequestEntityTooLarge
+			message = "Request entity too large"
+		}
 	}
 
-	var maxBytesErr *http.MaxBytesError
-	if errors.As(err, &maxBytesErr) {
-		rw.WriteJSON(
-			http.StatusRequestEntityTooLarge,
-			map[string]any{
-				"message": "Request entity too large",
-			},
-		)
-		return
+	if writeErr := rw.WriteJSON(status, map[string]any{"message": message}); writeErr != nil {
+		responseErr = errors.Join(responseErr, fmt.Errorf("write execution error response: %w", writeErr))
 	}
+	return responseErr
+}
 
-	rw.WriteJSON(
-		500,
-		map[string]any{
-			"message": "Internal server error",
-		},
-	)
+func stageResponseWriter(ctx core.ExecutionContext) *stagedResponseWriter {
+	rwAny, ok := ctx.Get("spine.response_writer")
+	if !ok {
+		return nil
+	}
+	rw, ok := rwAny.(core.ResponseWriter)
+	if !ok {
+		return nil
+	}
+	staged := newStagedResponseWriter(rw)
+	ctx.Set("spine.response_writer", staged)
+	return staged
 }
 
 func panicAsError(recovered any) error {

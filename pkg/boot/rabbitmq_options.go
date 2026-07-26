@@ -1,6 +1,9 @@
 package boot
 
-import "net/url"
+import (
+	"net/url"
+	"time"
+)
 
 /*
 RabbitMqOptions는 RabbitMQ 사용 여부와 Read(읽기), Write(쓰기) 역할을 정의합니다.
@@ -20,6 +23,11 @@ type RabbitMqOptions struct {
 	// ConsumerRetry는 전송 계층 또는 읽기 오류 후 브로커 재연결 방식을 제어합니다.
 	// 아래의 메시지별 FailurePolicy와는 별개입니다.
 	ConsumerRetry ConsumerRetryOptions
+
+	// PublisherRetry는 연결/채널 단절 또는 publisher confirm 실패 후 재연결과
+	// 재발행 방식을 제어합니다. 재발행은 at-least-once 전달이므로 호출자는 이벤트를
+	// 멱등하게 처리해야 합니다.
+	PublisherRetry PublisherRetryOptions
 
 	/*
 		Read는 이벤트 소비(컨슈머) 설정입니다.
@@ -42,6 +50,10 @@ type RabbitMqReadOptions struct {
 	// Exchange는 큐가 바인딩될 Exchange 이름입니다.
 	Exchange string
 
+	// PrefetchCount는 한 consumer에 동시에 전달될 수 있는 미확인 메시지 수입니다.
+	// 0이면 안전한 기본값 1을 사용하며, 설정할 때는 양수여야 합니다.
+	PrefetchCount int
+
 	// FailurePolicy는 핸들러 실패 후 수행할 동작을 명시적으로 선택합니다.
 	// 별도로 지정하지 않으면 유해 메시지의 반복 처리를 막기 위해 재큐잉하지 않고 거부합니다.
 	FailurePolicy RabbitMqFailurePolicy
@@ -55,6 +67,26 @@ type RabbitMqReadOptions struct {
 	// Deprecated: 대신 FailurePolicy를 사용하세요. true 값은 이전 버전과 호환되며
 	// RabbitMqFailureRequeue로 매핑됩니다.
 	RequeueOnError bool
+}
+
+// EffectivePrefetchCount는 RabbitMQ consumer에 적용할 실제 QoS prefetch 수를 반환합니다.
+func (o RabbitMqReadOptions) EffectivePrefetchCount() int {
+	if o.PrefetchCount == 0 {
+		return 1
+	}
+	return o.PrefetchCount
+}
+
+// PublisherRetryOptions는 RabbitMQ publish 전송 실패 후의 재연결 backoff와
+// broker confirm 대기 시간을 제어합니다. 0 값은 각각 100ms, 5s, 2배,
+// 20% jitter, 최대 3회 시도, confirm 5s를 사용합니다.
+type PublisherRetryOptions struct {
+	InitialDelay   time.Duration
+	MaxDelay       time.Duration
+	Multiplier     float64
+	Jitter         float64
+	MaxAttempts    int
+	ConfirmTimeout time.Duration
 }
 
 type RabbitMqFailurePolicy string
@@ -102,6 +134,9 @@ func (o RabbitMqOptions) ValidateIssues(prefix string) []ConfigIssue {
 		if o.Read.Exchange == "" {
 			issues = append(issues, ConfigIssue{configPath(prefix, "Read.Exchange"), "RABBITMQ_EXCHANGE_REQUIRED", "RabbitMQ consumer exchange is empty.", "Set a named topic exchange."})
 		}
+		if o.Read.PrefetchCount < 0 {
+			issues = append(issues, ConfigIssue{configPath(prefix, "Read.PrefetchCount"), "RABBITMQ_PREFETCH_COUNT_INVALID", "RabbitMQ prefetch count cannot be negative.", "Use zero for the safe default of 1 or a positive count."})
+		}
 		policy := o.Read.EffectiveFailurePolicy()
 		if policy != RabbitMqFailureReject && policy != RabbitMqFailureRequeue {
 			issues = append(issues, ConfigIssue{configPath(prefix, "Read.FailurePolicy"), "RABBITMQ_FAILURE_POLICY_INVALID", "RabbitMQ failure policy is not recognized.", "Use RabbitMqFailureReject or RabbitMqFailureRequeue."})
@@ -122,6 +157,9 @@ func (o RabbitMqOptions) ValidateIssues(prefix string) []ConfigIssue {
 			Hint:    "Set a named topic exchange for published events.",
 		})
 	}
+	if o.Write != nil {
+		issues = append(issues, o.PublisherRetry.validateIssues(configPath(prefix, "PublisherRetry"))...)
+	}
 	return issues
 }
 
@@ -134,4 +172,30 @@ Exchange 선언과 메시지 발행을 담당합니다.
 type RabbitMqWriteOptions struct {
 	// Exchange는 이벤트를 발행할 대상 Exchange 이름입니다.
 	Exchange string
+}
+
+func (o PublisherRetryOptions) validateIssues(prefix string) []ConfigIssue {
+	var issues []ConfigIssue
+	if o.InitialDelay < 0 {
+		issues = append(issues, ConfigIssue{configPath(prefix, "InitialDelay"), "RABBITMQ_PUBLISHER_RETRY_INITIAL_DELAY_INVALID", "Initial delay cannot be negative.", "Use zero for the default or a positive duration."})
+	}
+	if o.MaxDelay < 0 {
+		issues = append(issues, ConfigIssue{configPath(prefix, "MaxDelay"), "RABBITMQ_PUBLISHER_RETRY_MAX_DELAY_INVALID", "Maximum delay cannot be negative.", "Use zero for the default or a positive duration."})
+	}
+	if o.InitialDelay > 0 && o.MaxDelay > 0 && o.MaxDelay < o.InitialDelay {
+		issues = append(issues, ConfigIssue{configPath(prefix, "MaxDelay"), "RABBITMQ_PUBLISHER_RETRY_DELAY_RANGE_INVALID", "Maximum delay is shorter than the initial delay.", "Set MaxDelay greater than or equal to InitialDelay."})
+	}
+	if o.Multiplier < 0 || (o.Multiplier > 0 && o.Multiplier < 1) {
+		issues = append(issues, ConfigIssue{configPath(prefix, "Multiplier"), "RABBITMQ_PUBLISHER_RETRY_MULTIPLIER_INVALID", "Multiplier must be at least 1.", "Use zero for the default or a value of 1 or greater."})
+	}
+	if o.Jitter < 0 || o.Jitter > 1 {
+		issues = append(issues, ConfigIssue{configPath(prefix, "Jitter"), "RABBITMQ_PUBLISHER_RETRY_JITTER_INVALID", "Jitter must be between 0 and 1.", "Use zero for the default or a fraction such as 0.2."})
+	}
+	if o.MaxAttempts < 0 {
+		issues = append(issues, ConfigIssue{configPath(prefix, "MaxAttempts"), "RABBITMQ_PUBLISHER_RETRY_MAX_ATTEMPTS_INVALID", "Maximum attempts cannot be negative.", "Use zero for the default of 3 attempts or a positive attempt count."})
+	}
+	if o.ConfirmTimeout < 0 {
+		issues = append(issues, ConfigIssue{configPath(prefix, "ConfirmTimeout"), "RABBITMQ_PUBLISHER_CONFIRM_TIMEOUT_INVALID", "Publisher confirm timeout cannot be negative.", "Use zero for the default or a positive duration."})
+	}
+	return issues
 }

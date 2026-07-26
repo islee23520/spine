@@ -2,6 +2,8 @@ package ws
 
 import (
 	"context"
+	"net/http"
+	"net/url"
 	"sync"
 
 	"github.com/NARUBROWN/spine/core"
@@ -26,10 +28,92 @@ type WSExecutionContext struct {
 	payload     []byte
 	eventBus    publish.EventBus
 	store       map[string]any
+	request     *webSocketRequestSnapshot
 }
 
-func NewWSExecutionContext(ctx context.Context, connID string, path string, messageType int, payload []byte, eventBus publish.EventBus, sendFn func(int, []byte) error) core.WebSocketContext {
+type webSocketRequestSnapshot struct {
+	ctx        context.Context
+	path       string
+	headers    http.Header
+	queries    url.Values
+	cookies    map[string]string
+	remoteAddr string
+	host       string
+	requestURI string
+}
+
+func newWebSocketRequestSnapshot(req *http.Request) *webSocketRequestSnapshot {
+	if req == nil {
+		return &webSocketRequestSnapshot{
+			ctx:     context.Background(),
+			headers: make(http.Header),
+			queries: make(url.Values),
+			cookies: make(map[string]string),
+		}
+	}
+	queries := make(url.Values, len(req.URL.Query()))
+	for key, values := range req.URL.Query() {
+		queries[key] = append([]string(nil), values...)
+	}
+	cookies := make(map[string]string)
+	for _, cookie := range req.Cookies() {
+		if _, exists := cookies[cookie.Name]; !exists {
+			cookies[cookie.Name] = cookie.Value
+		}
+	}
+	return &webSocketRequestSnapshot{
+		ctx:        req.Context(),
+		path:       req.URL.Path,
+		headers:    req.Header.Clone(),
+		queries:    queries,
+		cookies:    cookies,
+		remoteAddr: req.RemoteAddr,
+		host:       req.Host,
+		requestURI: req.RequestURI,
+	}
+}
+
+func (s *webSocketRequestSnapshot) Context() context.Context  { return s.ctx }
+func (s *webSocketRequestSnapshot) Path() string              { return s.path }
+func (s *webSocketRequestSnapshot) Header(name string) string { return s.headers.Get(name) }
+func (s *webSocketRequestSnapshot) Headers() map[string][]string {
+	return s.headers.Clone()
+}
+func (s *webSocketRequestSnapshot) Query(name string) string { return s.queries.Get(name) }
+func (s *webSocketRequestSnapshot) Queries() map[string][]string {
+	copyValues := make(map[string][]string, len(s.queries))
+	for key, values := range s.queries {
+		copyValues[key] = append([]string(nil), values...)
+	}
+	return copyValues
+}
+func (s *webSocketRequestSnapshot) Cookie(name string) (string, bool) {
+	value, ok := s.cookies[name]
+	return value, ok
+}
+func (s *webSocketRequestSnapshot) Cookies() map[string]string {
+	copyCookies := make(map[string]string, len(s.cookies))
+	for name, value := range s.cookies {
+		copyCookies[name] = value
+	}
+	return copyCookies
+}
+func (s *webSocketRequestSnapshot) RemoteAddr() string { return s.remoteAddr }
+func (s *webSocketRequestSnapshot) Host() string       { return s.host }
+func (s *webSocketRequestSnapshot) RequestURI() string { return s.requestURI }
+
+func NewWSExecutionContext(ctx context.Context, connID string, path string, messageType int, payload []byte, eventBus publish.EventBus, sendFn func(int, []byte) error, request ...core.WebSocketHandshakeContext) core.WebSocketContext {
 	ctx = context.WithValue(ctx, pkgws.SenderKey, &connSender{send: sendFn})
+	requestSnapshot := &webSocketRequestSnapshot{
+		ctx:     ctx,
+		path:    path,
+		headers: make(http.Header),
+		queries: make(url.Values),
+		cookies: make(map[string]string),
+	}
+	if len(request) > 0 && request[0] != nil {
+		requestSnapshot = snapshotWebSocketRequest(ctx, request[0])
+	}
 
 	return &WSExecutionContext{
 		ctx:         ctx,
@@ -38,6 +122,32 @@ func NewWSExecutionContext(ctx context.Context, connID string, path string, mess
 		messageType: messageType,
 		payload:     payload,
 		eventBus:    eventBus,
+		request:     requestSnapshot,
+	}
+}
+
+func snapshotWebSocketRequest(ctx context.Context, request core.WebSocketHandshakeContext) *webSocketRequestSnapshot {
+	headers := make(http.Header)
+	for key, values := range request.Headers() {
+		headers[key] = append([]string(nil), values...)
+	}
+	queries := make(url.Values)
+	for key, values := range request.Queries() {
+		queries[key] = append([]string(nil), values...)
+	}
+	cookies := make(map[string]string)
+	for name, value := range request.Cookies() {
+		cookies[name] = value
+	}
+	return &webSocketRequestSnapshot{
+		ctx:        ctx,
+		path:       request.Path(),
+		headers:    headers,
+		queries:    queries,
+		cookies:    cookies,
+		remoteAddr: request.RemoteAddr(),
+		host:       request.Host(),
+		requestURI: request.RequestURI(),
 	}
 }
 
@@ -69,8 +179,18 @@ func (w *WSExecutionContext) Get(key string) (any, bool) {
 }
 
 func (w *WSExecutionContext) Header(name string) string {
-	return ""
+	return w.request.Header(name)
 }
+
+func (w *WSExecutionContext) Headers() map[string][]string { return w.request.Headers() }
+func (w *WSExecutionContext) Query(name string) string     { return w.request.Query(name) }
+func (w *WSExecutionContext) Cookie(name string) (string, bool) {
+	return w.request.Cookie(name)
+}
+func (w *WSExecutionContext) Cookies() map[string]string { return w.request.Cookies() }
+func (w *WSExecutionContext) RemoteAddr() string         { return w.request.RemoteAddr() }
+func (w *WSExecutionContext) Host() string               { return w.request.Host() }
+func (w *WSExecutionContext) RequestURI() string         { return w.request.RequestURI() }
 
 func (w *WSExecutionContext) MessageType() int {
 	return w.messageType
@@ -115,7 +235,7 @@ func (w *WSExecutionContext) Payload() []byte {
 }
 
 func (w *WSExecutionContext) Queries() map[string][]string {
-	return nil
+	return w.request.Queries()
 }
 
 func (w *WSExecutionContext) Set(key string, value any) {

@@ -31,8 +31,8 @@ type KafkaOptions struct {
 	// 사용해야 하며 명시적으로 활성화해야 합니다.
 	AllowInsecureTransport bool
 
-	// ConsumerRetry는 브로커 읽기 또는 연결 실패 후 복구 방식을 제어합니다. 핸들러 실패를
-	// 재시도하거나 메시지 ACK/NACK 동작을 변경하지는 않습니다.
+	// ConsumerRetry는 브로커 읽기·연결 실패 또는 실패한 ACK/NACK 뒤 reader를 다시
+	// 생성하는 방식을 제어합니다. 핸들러 호출 횟수나 메시지 ACK/NACK 의미는 변경하지 않습니다.
 	ConsumerRetry ConsumerRetryOptions
 
 	/*
@@ -48,7 +48,7 @@ type KafkaOptions struct {
 	Write *KafkaWriteOptions
 }
 
-// ConsumerRetryOptions는 Reader 오류 후 전송 계층의 재연결 방식을 제어합니다.
+// ConsumerRetryOptions는 Reader 오류 또는 실패한 ACK/NACK 뒤 전송 계층을 다시 연결하는 방식을 제어합니다.
 // 별도로 지정하지 않으면 안전한 기본값인 최초 지연 100ms, 최대 지연 5초,
 // 배수 2, 지터 20%, 무제한 재시도를 사용합니다.
 type ConsumerRetryOptions struct {

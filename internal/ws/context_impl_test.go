@@ -5,9 +5,19 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/NARUBROWN/spine/core"
 	internalpublish "github.com/NARUBROWN/spine/internal/event/publish"
 	pkgws "github.com/NARUBROWN/spine/pkg/ws"
 )
+
+type mutableCookiesHandshakeContext struct {
+	*webSocketRequestSnapshot
+	cookies map[string]string
+}
+
+func (c *mutableCookiesHandshakeContext) Cookies() map[string]string {
+	return c.cookies
+}
 
 func TestWSExecutionContext_StoresAndExposesValues(t *testing.T) {
 	ctx := NewWSExecutionContext(
@@ -126,5 +136,31 @@ func TestWSExecutionContext_EventBusIsSafeForConcurrentAccess(t *testing.T) {
 		if buses[i] != buses[0] {
 			t.Fatal("동시 접근에서도 동일한 EventBus 인스턴스를 반환해야 합니다")
 		}
+	}
+}
+
+func TestWSExecutionContext_ClonesCookiesFromCustomHandshakeContext(t *testing.T) {
+	request := &mutableCookiesHandshakeContext{
+		webSocketRequestSnapshot: newWebSocketRequestSnapshot(nil),
+		cookies:                  map[string]string{"session": "original"},
+	}
+	ctx := NewWSExecutionContext(
+		context.Background(),
+		"conn-1",
+		"/ws/echo",
+		pkgws.TextMessage,
+		nil,
+		nil,
+		func(int, []byte) error { return nil },
+		request,
+	)
+	request.cookies["session"] = "changed"
+
+	messageCtx, ok := ctx.(core.WebSocketMessageContext)
+	if !ok {
+		t.Fatal("WebSocket message context 계약을 구현해야 합니다")
+	}
+	if cookie, exists := messageCtx.Cookie("session"); !exists || cookie != "original" {
+		t.Fatalf("handshake cookie snapshot이 변경됐습니다: value=%q exists=%v", cookie, exists)
 	}
 }

@@ -37,8 +37,9 @@ func NewKafkaPublisher(opts *boot.KafkaOptions) (*KafkaPublisher, error) {
 	log.Println("[Kafka][Write] Event publisher initialized")
 
 	writer := &kafka.Writer{
-		Addr:     kafka.TCP(opts.Brokers...),
-		Balancer: &kafka.LeastBytes{},
+		Addr:         kafka.TCP(opts.Brokers...),
+		Balancer:     &kafka.LeastBytes{},
+		RequiredAcks: kafka.RequireAll,
 	}
 	if transport := effectiveTransport(*opts); transport != nil {
 		writer.Transport = transport

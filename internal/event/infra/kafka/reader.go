@@ -11,8 +11,14 @@ import (
 )
 
 type Reader struct {
-	reader *kafka.Reader
+	reader kafkaReader
 	opts   boot.KafkaOptions
+}
+
+type kafkaReader interface {
+	FetchMessage(context.Context) (kafka.Message, error)
+	CommitMessages(context.Context, ...kafka.Message) error
+	Close() error
 }
 
 func NewKafkaReader(topic string, opts boot.KafkaOptions) (*Reader, error) {
@@ -88,8 +94,9 @@ func (r *Reader) Read(ctx context.Context) (*consumer.Message, error) {
 	// NACK 콜백 설정: Kafka는 명시적 NACK이 없으므로 커밋하지 않음
 	// (컨슈머 그룹 재시작 시 재처리됨)
 	msg.SetNackHandler(func() error {
-		// Kafka는 명시적 NACK 대신 커밋하지 않으면 됨
-		return nil
+		// 같은 partition의 더 높은 offset이 커밋되어 실패 offset까지 포함되는 것을
+		// 막기 위해 Runtime이 현재 reader를 폐기하고 다시 생성하도록 요구합니다.
+		return consumer.ErrReaderInvalidated
 	})
 
 	return msg, nil

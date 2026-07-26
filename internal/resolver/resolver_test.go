@@ -298,6 +298,19 @@ func TestControllerContextResolver_Resolve(t *testing.T) {
 	}
 }
 
+func TestControllerContextResolver_DoesNotClaimUnsupportedExtendedInterface(t *testing.T) {
+	type extended interface {
+		core.ControllerContext
+		Principal() string
+	}
+
+	r := &ControllerContextResolver{}
+	pm := ParameterMeta{Type: reflect.TypeOf((*extended)(nil)).Elem()}
+	if r.Supports(pm) {
+		t.Fatal("실제 controller context view가 구현하지 않는 확장 인터페이스는 지원하면 안 됩니다")
+	}
+}
+
 func TestStdContextResolver_InjectsPublisher(t *testing.T) {
 	r := &StdContextResolver{}
 	pm := ParameterMeta{Type: reflect.TypeFor[context.Context]()}
