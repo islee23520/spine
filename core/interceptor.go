@@ -2,12 +2,12 @@ package core
 
 /*
 Interceptor는 실행 흐름의 횡단 관심사를 처리하는 계약이다.
-Controller/Invoker/Resolver는 Interceptor를 몰라야 한다.
+컨트롤러, Invoker, Resolver는 Interceptor를 몰라야 한다.
 */
 type Interceptor interface {
 	/*
-		PreHandle은 Controller 호출 전에 실행된다.
-		여기서 에러를 반환하면 실행을 중단한다.
+		PreHandle은 컨트롤러 호출 전에 실행된다.
+		여기서 오류를 반환하면 실행을 중단한다.
 	*/
 	PreHandle(ctx ExecutionContext, meta HandlerMeta) error
 
@@ -18,8 +18,16 @@ type Interceptor interface {
 	PostHandle(ctx ExecutionContext, meta HandlerMeta)
 
 	/*
+		BeforeResponse는 핸들러 실행과 후속 훅이 끝난 뒤, 응답을 쓰기 전에 실행된다.
+		PreHandle을 성공한 Interceptor만 역순으로 호출된다.
+		executionErr는 이 시점까지 발생한 최종 오류이며, 구현체가 반환한 오류는
+		최종 실행 오류에 포함된다.
+	*/
+	BeforeResponse(ctx ExecutionContext, meta HandlerMeta, executionErr error) error
+
+	/*
 		AfterCompletion은 성공/실패와 관계없이 마지막에 호출된다.
-		err는 Pipeline 실행 중 발생한 최종 에러
+		err는 파이프라인 실행 중 발생한 최종 오류
 	*/
 	AfterCompletion(ctx ExecutionContext, meta HandlerMeta, err error)
 }

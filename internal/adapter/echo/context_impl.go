@@ -20,7 +20,7 @@ type echoContext struct {
 func NewContext(c echo.Context) core.ExecutionContext {
 	return &echoContext{
 		echo:   c,
-		reqCtx: c.Request().Context(), // 요청시 생성되는 Context
+		reqCtx: c.Request().Context(), // 요청할 때 생성되는 컨텍스트
 	}
 }
 
@@ -44,7 +44,7 @@ func (e *echoContext) Header(name string) string {
 	return e.echo.Request().Header.Get(name)
 }
 
-// Headers return a map of all headers in the request.
+// Headers는 요청에 포함된 모든 헤더를 맵으로 반환합니다.
 func (e *echoContext) Headers() map[string][]string {
 	return e.echo.Request().Header
 }
@@ -82,7 +82,7 @@ func (e *echoContext) String(code int, value string) error {
 func (e *echoContext) Params() map[string]string {
 	if raw, ok := e.store["spine.params"]; ok {
 		if m, ok := raw.(map[string]string); ok {
-			// return a shallow copy to avoid mutation
+			// 원본이 변경되지 않도록 얕은 복사본을 반환합니다.
 			copyMap := make(map[string]string, len(m))
 			maps.Copy(copyMap, m)
 			return copyMap

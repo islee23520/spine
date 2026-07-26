@@ -19,6 +19,9 @@
 ## 링크
 
 - 공식 사이트: https://spine.na2ru2.me/ko/
+- [v0.5 보안 기본값 마이그레이션](docs/migration/v0.5.md)
+- [보안 설정 참고 자료](docs/security-configuration.md)
+- [보안 설정 실행 예제](examples/security-config/main.go)
 - Bun ORM + Swagger 통합 예제 프로젝트: https://github.com/NARUBROWN/spine-user-demo
 - Kafka MSA 예제 프로젝트: https://github.com/NARUBROWN/spine-simple-msa-demo
 - 간단한 WebSocket 채팅 예제 프로젝트: https://github.com/NARUBROWN/spine-simple-chat-demo

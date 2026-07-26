@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/NARUBROWN/spine/core"
@@ -80,10 +81,12 @@ func (r *countingRouter) Route(ctx core.ExecutionContext) (core.HandlerMeta, err
 }
 
 type testInterceptor struct {
-	name   string
-	events *[]string
-	preErr error
-	after  func(core.HandlerMeta, error)
+	name      string
+	events    *[]string
+	preErr    error
+	beforeErr error
+	before    func(core.HandlerMeta, error)
+	after     func(core.HandlerMeta, error)
 }
 
 func (i *testInterceptor) PreHandle(ctx core.ExecutionContext, meta core.HandlerMeta) error {
@@ -92,6 +95,13 @@ func (i *testInterceptor) PreHandle(ctx core.ExecutionContext, meta core.Handler
 }
 func (i *testInterceptor) PostHandle(ctx core.ExecutionContext, meta core.HandlerMeta) {
 	*i.events = append(*i.events, "post:"+i.name)
+}
+func (i *testInterceptor) BeforeResponse(ctx core.ExecutionContext, meta core.HandlerMeta, err error) error {
+	*i.events = append(*i.events, "before:"+i.name)
+	if i.before != nil {
+		i.before(meta, err)
+	}
+	return i.beforeErr
 }
 func (i *testInterceptor) AfterCompletion(ctx core.ExecutionContext, meta core.HandlerMeta, err error) {
 	*i.events = append(*i.events, "after:"+i.name)
@@ -244,6 +254,7 @@ func TestExecute_SuccessFlow(t *testing.T) {
 	p.AddReturnValueHandler(&testReturnHandler{
 		supports: func(rt reflect.Type) bool { return rt.Kind() == reflect.String },
 		handle: func(v any, ctx core.ExecutionContext) error {
+			events = append(events, "handle:success")
 			handled = true
 			if v.(string) != "ok" {
 				t.Fatalf("예상하지 못한 반환값입니다: %v", v)
@@ -269,7 +280,17 @@ func TestExecute_SuccessFlow(t *testing.T) {
 		t.Fatal("실행 후 훅이 호출되지 않았습니다")
 	}
 
-	expected := []string{"pre:global", "pre:route", "post:route", "post:global", "after:route", "after:global"}
+	expected := []string{
+		"pre:global",
+		"pre:route",
+		"before:route",
+		"before:global",
+		"handle:success",
+		"post:route",
+		"post:global",
+		"after:route",
+		"after:global",
+	}
 	if len(events) != len(expected) {
 		t.Fatalf("예상하지 못한 인터셉터 이벤트 개수입니다: %v", events)
 	}
@@ -317,11 +338,11 @@ func TestExecute_PostHookFailurePreventsSuccessHandling(t *testing.T) {
 	if !postHook.called {
 		t.Fatal("post hook이 호출되어야 합니다")
 	}
-	if !handled {
-		t.Fatal("성공 응답은 post hook 전에 작성되어야 합니다")
+	if handled {
+		t.Fatal("post hook 실패 후 성공 응답을 작성하면 안 됩니다")
 	}
-	if writer.status != 204 {
-		t.Fatalf("성공 응답이 먼저 기록되어야 합니다: %d", writer.status)
+	if writer.status != 500 {
+		t.Fatalf("post hook 실패는 성공 응답 전에 500으로 기록되어야 합니다: %d", writer.status)
 	}
 }
 
@@ -369,7 +390,7 @@ func TestExecute_AbortByInterceptor(t *testing.T) {
 		t.Fatalf("중단 시 컨트롤러가 호출되면 안 됩니다. 실제 호출 횟수: %d", controllerCalled)
 	}
 
-	expected := []string{"pre:global", "pre:route", "after:route", "after:global"}
+	expected := []string{"pre:global", "pre:route", "before:global", "after:route", "after:global"}
 	if len(events) != len(expected) {
 		t.Fatalf("예상하지 못한 인터셉터 이벤트 개수입니다: %v", events)
 	}
@@ -451,7 +472,7 @@ func TestExecute_MissingArgumentResolverReturnsError(t *testing.T) {
 	}
 }
 
-func TestExecute_SuccessReturnFailureSkipsPostHooks(t *testing.T) {
+func TestExecute_PostHooksRunBeforeSuccessReturnHandling(t *testing.T) {
 	controllerCalled := 0
 	p, _ := newPipelineWithController(t, "Handle", &controllerCalled)
 
@@ -477,8 +498,172 @@ func TestExecute_SuccessReturnFailureSkipsPostHooks(t *testing.T) {
 	if err == nil {
 		t.Fatal("리턴 핸들러 실패는 에러여야 합니다")
 	}
-	if postHook.called {
-		t.Fatal("성공 응답 작성이 실패하면 post hook은 실행되면 안 됩니다")
+	if !postHook.called {
+		t.Fatal("post hook은 성공 응답 작성 전에 실행되어야 합니다")
+	}
+}
+
+func TestExecute_ControllerReturnedErrorReachesBeforeResponseBeforeErrorWrite(t *testing.T) {
+	controllerCalled := 0
+	p, _ := newPipelineWithController(t, "Fail", &controllerCalled)
+
+	ctx := newTestExecutionContext()
+	writer := &testResponseWriter{}
+	ctx.Set("spine.response_writer", writer)
+
+	var beforeErr error
+	events := []string{}
+	p.AddInterceptor(&testInterceptor{
+		name:   "tx",
+		events: &events,
+		before: func(meta core.HandlerMeta, err error) {
+			beforeErr = err
+			if writer.committed {
+				t.Fatal("BeforeResponse 전에 오류 응답이 작성되면 안 됩니다")
+			}
+		},
+		after: func(meta core.HandlerMeta, err error) {
+			if err == nil || err.Error() != "boom" {
+				t.Fatalf("AfterCompletion은 컨트롤러 오류를 받아야 합니다: %v", err)
+			}
+			if !writer.committed {
+				t.Fatal("AfterCompletion은 오류 응답 처리 후 실행되어야 합니다")
+			}
+		},
+	})
+	p.AddReturnValueHandler(&handler.ErrorReturnHandler{})
+
+	err := p.Execute(ctx)
+	if err == nil || err.Error() != "boom" {
+		t.Fatalf("컨트롤러가 반환한 원래 오류가 전파되어야 합니다: %v", err)
+	}
+	if beforeErr == nil || beforeErr.Error() != "boom" {
+		t.Fatalf("BeforeResponse는 컨트롤러 오류를 받아야 합니다: %v", beforeErr)
+	}
+	if writer.status != 500 || writer.writes != 1 {
+		t.Fatalf("오류 응답은 finalization 후 한 번 기록되어야 합니다: status=%d writes=%d", writer.status, writer.writes)
+	}
+}
+
+func TestExecute_RecoversErrorResponseAndAfterCompletionPanics(t *testing.T) {
+	controllerCalled := 0
+	p, _ := newPipelineWithController(t, "Fail", &controllerCalled)
+
+	ctx := newTestExecutionContext()
+	writer := &testResponseWriter{}
+	ctx.Set("spine.response_writer", writer)
+
+	errorHandlerPanic := errors.New("error handler panic")
+	afterCompletionPanic := errors.New("after completion panic")
+	var afterCompletionErr error
+	events := []string{}
+	p.AddInterceptor(&testInterceptor{
+		name:   "observer",
+		events: &events,
+		after: func(meta core.HandlerMeta, err error) {
+			afterCompletionErr = err
+			panic(afterCompletionPanic)
+		},
+	})
+	p.AddReturnValueHandler(&testReturnHandler{
+		supports: func(rt reflect.Type) bool { return rt.Implements(reflect.TypeFor[error]()) },
+		handle: func(v any, ctx core.ExecutionContext) error {
+			panic(errorHandlerPanic)
+		},
+	})
+
+	err := p.Execute(ctx)
+	if !errors.Is(err, errorHandlerPanic) || !errors.Is(err, afterCompletionPanic) {
+		t.Fatalf("error response와 AfterCompletion panic이 최종 오류에 포함되어야 합니다: %v", err)
+	}
+	if afterCompletionErr == nil || !errors.Is(afterCompletionErr, errorHandlerPanic) || !strings.Contains(afterCompletionErr.Error(), "boom") {
+		t.Fatalf("AfterCompletion은 controller 오류와 error handler panic을 모두 받아야 합니다: %v", afterCompletionErr)
+	}
+	if writer.status != 500 || writer.writes != 1 {
+		t.Fatalf("error handler panic 후 generic 500 응답을 한 번 기록해야 합니다: status=%d writes=%d", writer.status, writer.writes)
+	}
+}
+
+func TestExecute_BeforeResponseErrorsFlowFromRouteToGlobal(t *testing.T) {
+	controllerCalled := 0
+	p, meta := newPipelineWithController(t, "Handle", &controllerCalled)
+
+	p.AddArgumentResolver(&testArgumentResolver{
+		supports: func(pm resolver.ParameterMeta) bool { return pm.Type.Kind() == reflect.Int },
+		resolve:  func(ctx core.ExecutionContext, pm resolver.ParameterMeta) (any, error) { return 7, nil },
+	})
+
+	events := []string{}
+	routeErr := errors.New("route finalization failed")
+	routeInterceptor := &testInterceptor{name: "route", events: &events, beforeErr: routeErr}
+	meta.Interceptors = []core.Interceptor{routeInterceptor}
+	p.router = &testRouter{meta: meta}
+
+	var globalExecutionErr error
+	p.AddInterceptor(&testInterceptor{
+		name:   "global",
+		events: &events,
+		before: func(meta core.HandlerMeta, err error) {
+			globalExecutionErr = err
+		},
+	})
+
+	err := p.Execute(newTestExecutionContext())
+	if !errors.Is(err, routeErr) {
+		t.Fatalf("route finalizer 오류가 최종 오류에 포함되어야 합니다: %v", err)
+	}
+	if !errors.Is(globalExecutionErr, routeErr) {
+		t.Fatalf("global finalizer는 route finalizer 오류를 받아야 합니다: %v", globalExecutionErr)
+	}
+}
+
+func TestExecute_BeforeResponseFailurePreventsSuccessWrite(t *testing.T) {
+	controllerCalled := 0
+	p, _ := newPipelineWithController(t, "Handle", &controllerCalled)
+
+	p.AddArgumentResolver(&testArgumentResolver{
+		supports: func(pm resolver.ParameterMeta) bool { return pm.Type.Kind() == reflect.Int },
+		resolve:  func(ctx core.ExecutionContext, pm resolver.ParameterMeta) (any, error) { return 7, nil },
+	})
+
+	ctx := newTestExecutionContext()
+	writer := &testResponseWriter{}
+	ctx.Set("spine.response_writer", writer)
+
+	events := []string{}
+	commitErr := errors.New("commit failed")
+	p.AddInterceptor(&testInterceptor{
+		name:      "tx",
+		events:    &events,
+		beforeErr: commitErr,
+		before: func(meta core.HandlerMeta, err error) {
+			if err != nil {
+				t.Fatalf("성공 실행의 BeforeResponse에는 기존 오류가 없어야 합니다: %v", err)
+			}
+			if writer.committed {
+				t.Fatal("commit 완료 전에 성공 응답이 작성되면 안 됩니다")
+			}
+		},
+	})
+
+	successHandled := false
+	p.AddReturnValueHandler(&testReturnHandler{
+		supports: func(rt reflect.Type) bool { return rt.Kind() == reflect.String },
+		handle: func(v any, ctx core.ExecutionContext) error {
+			successHandled = true
+			return writer.WriteString(200, v.(string))
+		},
+	})
+
+	err := p.Execute(ctx)
+	if !errors.Is(err, commitErr) {
+		t.Fatalf("BeforeResponse 오류가 최종 오류로 전파되어야 합니다: %v", err)
+	}
+	if successHandled {
+		t.Fatal("commit 실패 후 성공 ReturnValueHandler를 호출하면 안 됩니다")
+	}
+	if writer.status != 500 || writer.writes != 1 {
+		t.Fatalf("commit 실패는 성공 응답 대신 500이어야 합니다: status=%d writes=%d", writer.status, writer.writes)
 	}
 }
 

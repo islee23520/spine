@@ -47,70 +47,102 @@ func (p *Pipeline) AddReturnValueHandler(handlers ...handler.ReturnValueHandler)
 
 // Execute는 하나의 요청 실행 전체를 소유합니다.
 func (p *Pipeline) Execute(ctx core.ExecutionContext) (finalErr error) {
+	globalMeta := core.HandlerMeta{}
+	var routeInterceptors []core.Interceptor
+	var globalFinalizers []core.Interceptor
+	var routeFinalizers []core.Interceptor
+	var results []any
+	var returnedErr error
+	beforeResponseCalled := false
+
+	// AfterCompletion은 응답 처리가 끝난 뒤 실행한다.
+	defer func() {
+		for i := len(routeInterceptors) - 1; i >= 0; i-- {
+			if err := callAfterCompletion(routeInterceptors[i], ctx, globalMeta, finalErr); err != nil {
+				finalErr = errors.Join(finalErr, err)
+			}
+		}
+		for i := len(p.interceptors) - 1; i >= 0; i-- {
+			if err := callAfterCompletion(p.interceptors[i], ctx, globalMeta, finalErr); err != nil {
+				finalErr = errors.Join(finalErr, err)
+			}
+		}
+	}()
+
+	// 실행 오류는 BeforeResponse가 끝난 뒤 HTTP 오류 응답으로 변환한다.
+	defer func() {
+		if finalErr == nil {
+			return
+		}
+
+		if returnedErr != nil {
+			handled, err := callHandleErrorReturn(p, ctx, results)
+			if err != nil {
+				finalErr = errors.Join(finalErr, err)
+			} else if handled {
+				return
+			}
+		}
+
+		if err := callHandleExecutionError(p, ctx, finalErr); err != nil {
+			finalErr = errors.Join(finalErr, err)
+		}
+	}()
+
+	// 패닉과 모든 조기 반환도 응답 전에 동일한 마무리 처리를 거친다.
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			finalErr = panicAsError(recovered)
 		}
-		if finalErr != nil {
-			p.handleExecutionError(ctx, finalErr)
+		if !beforeResponseCalled {
+			finalErr = runBeforeResponse(ctx, globalMeta, routeFinalizers, globalFinalizers, finalErr)
+			beforeResponseCalled = true
 		}
 	}()
 
-	globalMeta := core.HandlerMeta{}
-	defer func() {
-		for i := len(p.interceptors) - 1; i >= 0; i-- {
-			p.interceptors[i].AfterCompletion(ctx, globalMeta, finalErr)
-		}
-	}()
-
-	// 글로벌 Interceptor는 라우팅 전에 먼저 실행한다.
+	// 글로벌 인터셉터는 라우팅 전에 먼저 실행한다.
 	for _, it := range p.interceptors {
 		if err := it.PreHandle(ctx, globalMeta); err != nil {
 			if errors.Is(err, core.ErrAbortPipeline) {
-				// Interceptor가 의도적으로 요청을 종료함 (응답은 이미 작성됨)
+				// 인터셉터가 의도적으로 요청을 종료함(응답은 이미 작성됨)
 				return nil
 			}
 			return err
 		}
+		globalFinalizers = append(globalFinalizers, it)
 	}
 
-	// Router가 실행 대상을 결정
+	// 라우터가 실행 대상을 결정
 	meta, err := p.router.Route(ctx)
 	if err != nil {
 		return err
 	}
 	globalMeta = meta
 
-	routeInterceptors := meta.Interceptors
-
-	// 라우트 Interceptor AfterCompletion은 무조건 보장
-	defer func() {
-		for i := len(routeInterceptors) - 1; i >= 0; i-- {
-			routeInterceptors[i].AfterCompletion(ctx, meta, finalErr)
-		}
-	}()
+	routeInterceptors = meta.Interceptors
 
 	paramMetas := buildParameterMeta(meta.Method, meta.PathKeys)
 
-	// Argument Resolver 체인 실행
+	// 인자 리졸버 체인 실행
 	args, err := p.resolveArguments(ctx, paramMetas)
 	if err != nil {
 		return err
 	}
 
-	// 라우트 Interceptor preHandle
+	// 라우트 인터셉터의 사전 처리 실행
 	for _, it := range routeInterceptors {
 		if err := it.PreHandle(ctx, meta); err != nil {
 			if errors.Is(err, core.ErrAbortPipeline) {
-				// Interceptor가 의도적으로 요청을 종료함 (응답은 이미 작성됨)
+				// 인터셉터가 의도적으로 요청을 종료함(응답은 이미 작성됨)
 				return nil
 			}
 			return err
 		}
+		routeFinalizers = append(routeFinalizers, it)
 	}
 
-	// Controller Method 호출
-	results, err := p.invoker.Invoke(
+	// 컨트롤러 메서드 호출
+	results, err = p.invoker.Invoke(
 		meta.ControllerType,
 		meta.Method,
 		args,
@@ -119,16 +151,9 @@ func (p *Pipeline) Execute(ctx core.ExecutionContext) (finalErr error) {
 		return err
 	}
 
-	handled, err := p.handleErrorReturn(ctx, results)
-	if err != nil {
-		return err
-	}
-	if handled {
-		return nil
-	}
-
-	if err := p.handleSuccessReturn(ctx, results); err != nil {
-		return err
+	returnedErr = findReturnedError(results)
+	if returnedErr != nil {
+		return returnedErr
 	}
 
 	for _, hook := range p.postHooks {
@@ -137,16 +162,115 @@ func (p *Pipeline) Execute(ctx core.ExecutionContext) (finalErr error) {
 		}
 	}
 
-	// 라우트 Interceptor postHandle (역순)
+	finalErr = runBeforeResponse(ctx, globalMeta, routeFinalizers, globalFinalizers, nil)
+	beforeResponseCalled = true
+	if finalErr != nil {
+		return finalErr
+	}
+
+	if err := p.handleSuccessReturn(ctx, results); err != nil {
+		return err
+	}
+
+	// 라우트 인터셉터의 사후 처리 실행(역순)
 	for i := len(routeInterceptors) - 1; i >= 0; i-- {
 		routeInterceptors[i].PostHandle(ctx, meta)
 	}
 
-	// 글로벌 Interceptor postHandle (역순)
+	// 전역 인터셉터의 사후 처리 실행(역순)
 	for i := len(p.interceptors) - 1; i >= 0; i-- {
 		p.interceptors[i].PostHandle(ctx, meta)
 	}
 
+	return nil
+}
+
+func findReturnedError(results []any) error {
+	for _, result := range results {
+		if isNilResult(result) {
+			continue
+		}
+		if err, ok := result.(error); ok {
+			return err
+		}
+	}
+	return nil
+}
+
+func runBeforeResponse(
+	ctx core.ExecutionContext,
+	meta core.HandlerMeta,
+	routeInterceptors []core.Interceptor,
+	globalInterceptors []core.Interceptor,
+	executionErr error,
+) error {
+	finalErr := executionErr
+	for i := len(routeInterceptors) - 1; i >= 0; i-- {
+		if err := callBeforeResponse(routeInterceptors[i], ctx, meta, finalErr); err != nil {
+			finalErr = errors.Join(finalErr, err)
+		}
+	}
+	for i := len(globalInterceptors) - 1; i >= 0; i-- {
+		if err := callBeforeResponse(globalInterceptors[i], ctx, meta, finalErr); err != nil {
+			finalErr = errors.Join(finalErr, err)
+		}
+	}
+	return finalErr
+}
+
+func callBeforeResponse(
+	interceptor core.Interceptor,
+	ctx core.ExecutionContext,
+	meta core.HandlerMeta,
+	executionErr error,
+) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = panicAsError(recovered)
+		}
+	}()
+	return interceptor.BeforeResponse(ctx, meta, executionErr)
+}
+
+func callAfterCompletion(
+	interceptor core.Interceptor,
+	ctx core.ExecutionContext,
+	meta core.HandlerMeta,
+	executionErr error,
+) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = panicAsError(recovered)
+		}
+	}()
+	interceptor.AfterCompletion(ctx, meta, executionErr)
+	return nil
+}
+
+func callHandleErrorReturn(
+	p *Pipeline,
+	ctx core.ExecutionContext,
+	results []any,
+) (handled bool, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = panicAsError(recovered)
+		}
+	}()
+	return p.handleErrorReturn(ctx, results)
+}
+
+func callHandleExecutionError(
+	p *Pipeline,
+	ctx core.ExecutionContext,
+	executionErr error,
+) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = panicAsError(recovered)
+		}
+	}()
+	p.handleExecutionError(ctx, executionErr)
 	return nil
 }
 
@@ -182,7 +306,7 @@ func isPathType(pt reflect.Type) bool {
 	return pt.PkgPath() == pathPkg
 }
 
-// isNilResult 명시적 nil 체크: error 인터페이스에 nil이 담긴 경우처럼
+// isNilResult는 명시적으로 nil을 검사합니다. error 인터페이스에 nil이 담긴 경우처럼
 // 타입 정보가 있으나 값이 nil인 경우까지 포괄적으로 처리한다.
 func isNilResult(v any) bool {
 	if v == nil {

@@ -35,6 +35,14 @@ func (i *LoggingInterceptor) PostHandle(
 	)
 }
 
+func (i *LoggingInterceptor) BeforeResponse(
+	ctx core.ExecutionContext,
+	meta core.HandlerMeta,
+	executionErr error,
+) error {
+	return nil
+}
+
 func (i *LoggingInterceptor) AfterCompletion(
 	ctx core.ExecutionContext,
 	meta core.HandlerMeta,

@@ -126,6 +126,42 @@ func TestCORSInterceptor_DisallowedOriginOmitsAllowOrigin(t *testing.T) {
 	}
 }
 
+func TestCORSInterceptor_WildcardNeverEnablesCredentials(t *testing.T) {
+	config := Config{
+		AllowOrigins:     []string{"*"},
+		AllowCredentials: true,
+	}
+
+	interceptor, err := NewValidated(config)
+	if interceptor != nil {
+		t.Fatal("invalid wildcard policy must not construct an interceptor")
+	}
+	if !errors.Is(err, ErrWildcardOriginWithCredentials) {
+		t.Fatalf("expected wildcard credentials validation error: %v", err)
+	}
+	var configErr *ConfigError
+	if !errors.As(err, &configErr) {
+		t.Fatalf("expected structured ConfigError: %T", err)
+	}
+	if configErr.Code != ConfigErrorCodeWildcardOriginWithCredentials || configErr.Path != ConfigErrorPathAllowOrigins || configErr.Hint == "" {
+		t.Fatalf("unexpected structured error: %+v", configErr)
+	}
+
+	// 기존 생성자는 소스 호환성을 유지하면서도 응답 헤더를 내보내기 전에
+	// 동일한 검증 오류를 보고합니다.
+	interceptor = New(config)
+	ctx := newTestExecutionContext("GET")
+	ctx.headers["Origin"] = "https://attacker.example"
+	writer := newTestResponseWriter()
+	ctx.Set("spine.response_writer", writer)
+	if err := interceptor.PreHandle(ctx, core.HandlerMeta{}); !errors.Is(err, ErrWildcardOriginWithCredentials) {
+		t.Fatalf("legacy constructor must surface validation error: %v", err)
+	}
+	if len(writer.headers) != 0 {
+		t.Fatalf("invalid policy must not emit any CORS headers: %v", writer.headers)
+	}
+}
+
 func TestCORSInterceptor_NoResponseWriterIsNoop(t *testing.T) {
 	interceptor := New(Config{})
 	ctx := newTestExecutionContext("GET")

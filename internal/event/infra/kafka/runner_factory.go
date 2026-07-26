@@ -19,3 +19,13 @@ func (f *RunnerFactory) Build(registration consumer.Registration) (consumer.Read
 		f.opts,
 	)
 }
+
+func (f *RunnerFactory) ConsumerRetryPolicy() consumer.TransportRetryPolicy {
+	return consumer.NewTransportRetryPolicy(
+		f.opts.ConsumerRetry.InitialDelay,
+		f.opts.ConsumerRetry.MaxDelay,
+		f.opts.ConsumerRetry.Multiplier,
+		f.opts.ConsumerRetry.Jitter,
+		f.opts.ConsumerRetry.MaxAttempts,
+	)
+}

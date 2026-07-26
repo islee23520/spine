@@ -19,6 +19,9 @@ It does not hide how a request is resolved and executed.
 ## Links
 
 - Official site: https://spine.na2ru2.me/en/
+- [v0.5 secure-default migration](docs/migration/v0.5.en.md)
+- [Security configuration reference](docs/security-configuration.en.md)
+- [Runnable security configuration example](examples/security-config/main.go)
 - Bun ORM + Swagger integration example project: https://github.com/NARUBROWN/spine-user-demo
 - Kafka MSA example project: https://github.com/NARUBROWN/spine-simple-msa-demo
 - Simple WebSocket chat example project: https://github.com/NARUBROWN/spine-simple-chat-demo

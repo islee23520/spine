@@ -45,12 +45,17 @@ func (h *RedirectReturnValueHandler) Handle(value any, ctx core.ExecutionContext
 		return fmt.Errorf("invalid ResponseWriter type")
 	}
 
+	serializedCookies, err := serializeCookiesValidated(redirect.Options.Cookies)
+	if err != nil {
+		return fmt.Errorf("RedirectReturnValueHandler: %w", err)
+	}
+
 	for k, v := range redirect.Options.Headers {
 		rw.SetHeader(k, v)
 	}
 
-	for _, c := range redirect.Options.Cookies {
-		rw.AddHeader("Set-Cookie", serializeCookie(c))
+	for _, cookie := range serializedCookies {
+		rw.AddHeader("Set-Cookie", cookie)
 	}
 
 	rw.SetHeader("Location", redirect.Location)
@@ -63,15 +68,42 @@ func (h *RedirectReturnValueHandler) Handle(value any, ctx core.ExecutionContext
 	return rw.WriteStatus(status)
 }
 
-func serializeCookie(c httpx.Cookie) string {
+func serializeCookiesValidated(cookies []httpx.Cookie) ([]string, error) {
+	serialized := make([]string, 0, len(cookies))
+	for index, cookie := range cookies {
+		value, err := serializeCookieValidated(cookie)
+		if err != nil {
+			return nil, fmt.Errorf("invalid cookie at index %d: %w", index, err)
+		}
+		serialized = append(serialized, value)
+	}
+	return serialized, nil
+}
+
+func serializeCookieValidated(c httpx.Cookie) (string, error) {
 	var parts []string
 
+	if c.Name == "" {
+		return "", fmt.Errorf("cookie Name must not be empty")
+	}
+	if err := validateCookieToken("Name", c.Name); err != nil {
+		return "", err
+	}
+	if err := validateCookieValue("Value", c.Value); err != nil {
+		return "", err
+	}
 	parts = append(parts, fmt.Sprintf("%s=%s", c.Name, c.Value))
 
 	if c.Path != "" {
+		if err := validateCookieValue("Path", c.Path); err != nil {
+			return "", err
+		}
 		parts = append(parts, "Path="+c.Path)
 	}
 	if c.Domain != "" {
+		if err := validateCookieValue("Domain", c.Domain); err != nil {
+			return "", err
+		}
 		parts = append(parts, "Domain="+c.Domain)
 	}
 	if c.MaxAge != 0 {
@@ -87,11 +119,45 @@ func serializeCookie(c httpx.Cookie) string {
 		parts = append(parts, "Secure")
 	}
 	if c.SameSite != "" {
+		switch c.SameSite {
+		case httpx.SameSiteLax, httpx.SameSiteStrict, httpx.SameSiteNone:
+		default:
+			return "", fmt.Errorf("cookie SameSite must be one of Lax, Strict, or None: %q", c.SameSite)
+		}
+		if err := validateCookieToken("SameSite", string(c.SameSite)); err != nil {
+			return "", err
+		}
 		parts = append(parts, "SameSite="+string(c.SameSite))
 	}
 	if c.Priority != "" {
+		switch c.Priority {
+		case "Low", "Medium", "High":
+		default:
+			return "", fmt.Errorf("cookie Priority must be one of Low, Medium, or High: %q", c.Priority)
+		}
+		if err := validateCookieToken("Priority", c.Priority); err != nil {
+			return "", err
+		}
 		parts = append(parts, "Priority="+c.Priority)
 	}
 
-	return strings.Join(parts, "; ")
+	return strings.Join(parts, "; "), nil
+}
+
+func validateCookieToken(field, value string) error {
+	for index, r := range value {
+		if r <= 0x20 || r >= 0x7f || r == ';' || r == ',' || r == '=' {
+			return fmt.Errorf("cookie %s contains invalid character %q at byte %d", field, r, index)
+		}
+	}
+	return nil
+}
+
+func validateCookieValue(field, value string) error {
+	for index, r := range value {
+		if r <= 0x20 || r >= 0x7f || r == ';' || r == ',' {
+			return fmt.Errorf("cookie %s contains invalid character %q at byte %d", field, r, index)
+		}
+	}
+	return nil
 }

@@ -22,6 +22,12 @@ func NewRabbitMqWriter(opts boot.RabbitMqOptions) (*Writer, error) {
 	if opts.Write == nil {
 		return nil, errors.New("RabbitMQ write options are not configured")
 	}
+	if opts.Write.Exchange == "" {
+		return nil, errors.New("RabbitMQ write exchange cannot be empty")
+	}
+	if err := validateBrokerURL(opts.URL, opts.AllowInsecureTransport); err != nil {
+		return nil, err
+	}
 
 	conn, err := amqp091.Dial(opts.URL)
 	if err != nil {
@@ -37,10 +43,10 @@ func NewRabbitMqWriter(opts boot.RabbitMqOptions) (*Writer, error) {
 	err = ch.ExchangeDeclare(
 		opts.Write.Exchange,
 		"topic",
-		true,  // durable
-		false, // auto-delete
-		false, // internal
-		false, // no-wait
+		true,  // 영속 교환기
+		false, // 자동 삭제 안 함
+		false, // 내부용 아님
+		false, // 서버 응답을 기다림
 		nil,
 	)
 

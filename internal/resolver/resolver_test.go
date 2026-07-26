@@ -45,7 +45,7 @@ func newFakeHttpCtx() *fakeHttpCtx {
 	}
 }
 
-// ExecutionContext
+// 실행 컨텍스트
 func (c *fakeHttpCtx) Context() context.Context  { return context.Background() }
 func (c *fakeHttpCtx) EventBus() core.EventBus   { return c.bus }
 func (c *fakeHttpCtx) Method() string            { return c.method }
@@ -62,7 +62,7 @@ func (c *fakeHttpCtx) Queries() map[string][]string { return c.queries }
 func (c *fakeHttpCtx) Set(key string, value any)    { c.store[key] = value }
 func (c *fakeHttpCtx) Get(key string) (any, bool)   { v, ok := c.store[key]; return v, ok }
 
-// HttpRequestContext
+// HTTP 요청 컨텍스트
 func (c *fakeHttpCtx) Param(name string) string { return c.params[name] }
 func (c *fakeHttpCtx) Query(name string) string {
 	if vs, ok := c.queries[name]; ok && len(vs) > 0 {

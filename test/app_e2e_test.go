@@ -11,10 +11,12 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/NARUBROWN/spine"
+	"github.com/NARUBROWN/spine/core"
 	"github.com/NARUBROWN/spine/pkg/boot"
 	"github.com/NARUBROWN/spine/pkg/httpx"
 	pkgws "github.com/NARUBROWN/spine/pkg/ws"
@@ -25,7 +27,31 @@ const (
 	e2eHelperEnv        = "SPINE_E2E_HELPER"
 	e2eAddressEnv       = "SPINE_E2E_ADDRESS"
 	e2eSignalOnMountEnv = "SPINE_E2E_SIGNAL_ON_MOUNT"
+	e2eSignalOnInitEnv  = "SPINE_E2E_SIGNAL_ON_INIT"
 )
+
+type e2eSignalOnInitTransport struct {
+	stopped  chan struct{}
+	stopOnce sync.Once
+}
+
+func (t *e2eSignalOnInitTransport) Init(core.Container) error {
+	process, err := os.FindProcess(os.Getpid())
+	if err != nil {
+		return err
+	}
+	return process.Signal(os.Interrupt)
+}
+
+func (t *e2eSignalOnInitTransport) Start() error {
+	<-t.stopped
+	return nil
+}
+
+func (t *e2eSignalOnInitTransport) Stop(context.Context) error {
+	t.stopOnce.Do(func() { close(t.stopped) })
+	return nil
+}
 
 type e2eController struct{}
 
@@ -43,11 +69,26 @@ func (c *e2eController) Echo(ctx context.Context, payload []byte) error {
 	return pkgws.Send(ctx, pkgws.TextMessage, payload)
 }
 
-// TestAppE2EHelperProcess is executed only by TestAppE2E_HTTPWebSocketAndShutdown's
-// child process. Keeping the server in a separate process exercises App.Run's
-// listener and signal-driven graceful shutdown without signaling the test runner.
+// TestAppE2EHelperProcess는 TestAppE2E_HTTPWebSocketAndShutdown이 실행한 자식
+// 프로세스에서만 동작합니다. 서버를 별도 프로세스에 두어 테스트 실행기에는 신호를
+// 보내지 않으면서 App.Run의 리스너와 신호 기반의 정상 종료를 검증합니다.
 func TestAppE2EHelperProcess(t *testing.T) {
 	if os.Getenv(e2eHelperEnv) != "1" {
+		return
+	}
+
+	if os.Getenv(e2eSignalOnInitEnv) == "1" {
+		transport := &e2eSignalOnInitTransport{stopped: make(chan struct{})}
+		app := spine.New()
+		app.RegisterTransport(transport)
+		if err := app.Run(boot.Options{ShutdownTimeout: 3 * time.Second}); err != nil {
+			t.Fatalf("run custom transport E2E helper app: %v", err)
+		}
+		select {
+		case <-transport.stopped:
+		default:
+			t.Fatal("custom transport was not stopped after startup signal")
+		}
 		return
 	}
 
@@ -191,6 +232,28 @@ func TestAppE2E_ShutdownSignalDuringStartup(t *testing.T) {
 			t.Fatalf("startup signal was not handled before timeout: %v\n%s", ctx.Err(), processOutput.String())
 		}
 		t.Fatalf("startup signal did not shut down cleanly: %v\n%s", err, processOutput.String())
+	}
+}
+
+func TestAppE2E_CustomTransportShutdownSignalDuringInit(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("graceful signal verification requires Unix process signals")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var processOutput bytes.Buffer
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestAppE2EHelperProcess$")
+	cmd.Env = append(os.Environ(), e2eHelperEnv+"=1", e2eSignalOnInitEnv+"=1")
+	cmd.Stdout = &processOutput
+	cmd.Stderr = &processOutput
+
+	if err := cmd.Run(); err != nil {
+		if ctx.Err() != nil {
+			t.Fatalf("custom transport startup signal was not handled before timeout: %v\n%s", ctx.Err(), processOutput.String())
+		}
+		t.Fatalf("custom transport startup signal did not shut down cleanly: %v\n%s", err, processOutput.String())
 	}
 }
 

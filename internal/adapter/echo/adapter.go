@@ -107,7 +107,7 @@ func newEcho(opts normalizedHTTPOptions) *echo.Echo {
 	return e
 }
 
-// simpleRecover는 외부 의존 없이 panic을 500으로 변환하는 최소한의 미들웨어입니다.
+// simpleRecover는 외부 의존 없이 패닉을 500 응답으로 변환하는 최소한의 미들웨어입니다.
 func simpleRecover() echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {

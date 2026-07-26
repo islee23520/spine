@@ -61,17 +61,17 @@ func (c *ConsumerRequestContextImpl) Set(key string, value any) {
 }
 
 func (c *ConsumerRequestContextImpl) Header(key string) string {
-	// Consumer 실행 컨텍스트에는 HTTP Header 개념이 없으므로 항상 빈 문자열을 반환합니다.
+	// 컨슈머 실행 컨텍스트에는 HTTP 헤더 개념이 없으므로 항상 빈 문자열을 반환합니다.
 	return ""
 }
 
 func (c *ConsumerRequestContextImpl) Method() string {
-	// Consumer 실행은 HTTP Method 개념이 없으며, 라우팅 구분을 위해 EVENT를 사용합니다.
+	// 컨슈머 실행에는 HTTP 메서드 개념이 없으며, 라우팅 구분을 위해 EVENT를 사용합니다.
 	return "EVENT"
 }
 
 func (c *ConsumerRequestContextImpl) Path() string {
-	// Consumer 라우팅에서 Path는 EventName을 그대로 사용합니다.
+	// 컨슈머 라우팅의 경로에는 EventName을 그대로 사용합니다.
 	return c.msg.EventName
 }
 

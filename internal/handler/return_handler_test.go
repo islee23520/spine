@@ -99,6 +99,7 @@ func TestJSONReturnHandler_Handle(t *testing.T) {
 		Options: httpx.ResponseOptions{
 			Status:  201,
 			Headers: map[string]string{"X-Test": "1"},
+			Cookies: []httpx.Cookie{{Name: "session", Value: "abc", Path: "/", HttpOnly: true}},
 		},
 	}
 
@@ -110,6 +111,9 @@ func TestJSONReturnHandler_Handle(t *testing.T) {
 	}
 	if writer.headers["X-Test"] != "1" {
 		t.Fatalf("헤더가 설정되지 않았습니다: %v", writer.headers)
+	}
+	if len(writer.setCookies) != 1 || writer.setCookies[0] != "session=abc; Path=/; HttpOnly" {
+		t.Fatalf("정상 쿠키가 보존되지 않았습니다: %v", writer.setCookies)
 	}
 }
 
@@ -126,12 +130,18 @@ func TestStringReturnHandler_SupportsAndHandle(t *testing.T) {
 	writer := newFakeWriter()
 	ctx.Set("spine.response_writer", writer)
 
-	resp := httpx.Response[string]{Body: "ok"}
+	resp := httpx.Response[string]{
+		Body:    "ok",
+		Options: httpx.ResponseOptions{Cookies: []httpx.Cookie{{Name: "theme", Value: "dark"}}},
+	}
 	if err := h.Handle(resp, ctx); err != nil {
 		t.Fatalf("StringReturnHandler Handle 실패: %v", err)
 	}
 	if writer.stringBody != "ok" {
 		t.Fatalf("문자열 응답이 잘못되었습니다: %q", writer.stringBody)
+	}
+	if len(writer.setCookies) != 1 || writer.setCookies[0] != "theme=dark" {
+		t.Fatalf("정상 쿠키가 보존되지 않았습니다: %v", writer.setCookies)
 	}
 
 	ptrResp := &httpx.Response[string]{Body: "ptr"}
@@ -168,6 +178,7 @@ func TestBinaryReturnHandler_Handle(t *testing.T) {
 		Data:        []byte{1, 2, 3},
 		Options: httpx.ResponseOptions{
 			Headers: map[string]string{"X-Bin": "yes"},
+			Cookies: []httpx.Cookie{{Name: "download", Value: "yes", Secure: true}},
 		},
 	}
 
@@ -184,6 +195,9 @@ func TestBinaryReturnHandler_Handle(t *testing.T) {
 	if writer.headers["Content-Type"] != "image/png" || writer.headers["X-Bin"] != "yes" {
 		t.Fatalf("헤더가 설정되지 않았습니다: %v", writer.headers)
 	}
+	if len(writer.setCookies) != 1 || writer.setCookies[0] != "download=yes; Secure" {
+		t.Fatalf("정상 쿠키가 보존되지 않았습니다: %v", writer.setCookies)
+	}
 
 	ptrBin := &httpx.Binary{
 		ContentType: "application/octet-stream",
@@ -194,6 +208,118 @@ func TestBinaryReturnHandler_Handle(t *testing.T) {
 	}
 	if string(writer.bytesBody) != string([]byte{4, 5, 6}) {
 		t.Fatalf("포인터 binary 응답이 잘못되었습니다: %v", writer.bytesBody)
+	}
+}
+
+func TestRedirectReturnHandler_RejectsInjectedCookieWithoutPartialResponse(t *testing.T) {
+	h := &RedirectReturnValueHandler{}
+	ctx := newFakeExecutionContext()
+	writer := newFakeWriter()
+	ctx.Set("spine.response_writer", writer)
+
+	err := h.Handle(httpx.Redirect{
+		Location: "/target",
+		Options: httpx.ResponseOptions{
+			Headers: map[string]string{"X-Partial": "must-not-be-written"},
+			Cookies: []httpx.Cookie{
+				{Name: "valid-first", Value: "must-not-be-written"},
+				{Name: "session", Value: "attacker; Domain=example.com"},
+			},
+		},
+	}, ctx)
+	if err == nil {
+		t.Fatal("injected cookie attributes must return an explicit error")
+	}
+	if writer.status != 0 || len(writer.headers) != 0 || len(writer.setCookies) != 0 {
+		t.Fatalf("invalid cookie must not produce a partial response: status=%d headers=%v cookies=%v", writer.status, writer.headers, writer.setCookies)
+	}
+}
+
+func TestResponseHandlers_RejectInvalidCookieWithoutPartialResponse(t *testing.T) {
+	invalidOptions := httpx.ResponseOptions{
+		Headers: map[string]string{"X-Partial": "must-not-be-written"},
+		Cookies: []httpx.Cookie{
+			{Name: "valid-first", Value: "must-not-be-written"},
+			{Name: "session", Value: "safe\r\nX-Injected: true"},
+		},
+	}
+
+	tests := []struct {
+		name   string
+		handle func(core.ExecutionContext) error
+	}{
+		{
+			name: "json",
+			handle: func(ctx core.ExecutionContext) error {
+				return (&JSONReturnHandler{}).Handle(httpx.Response[int]{Body: 1, Options: invalidOptions}, ctx)
+			},
+		},
+		{
+			name: "string",
+			handle: func(ctx core.ExecutionContext) error {
+				return (&StringReturnHandler{}).Handle(httpx.Response[string]{Body: "ok", Options: invalidOptions}, ctx)
+			},
+		},
+		{
+			name: "binary",
+			handle: func(ctx core.ExecutionContext) error {
+				return (&BinaryReturnHandler{}).Handle(httpx.Binary{Data: []byte("ok"), ContentType: "text/plain", Options: invalidOptions}, ctx)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := newFakeExecutionContext()
+			writer := newFakeWriter()
+			ctx.Set("spine.response_writer", writer)
+
+			err := tt.handle(ctx)
+			if err == nil {
+				t.Fatal("invalid cookie must return an explicit error")
+			}
+			if writer.status != 0 || len(writer.headers) != 0 || len(writer.setCookies) != 0 || writer.writeJSONCalls != 0 || writer.writeStringCalls != 0 || writer.writeBytesCalls != 0 {
+				t.Fatalf("invalid cookie must not produce a partial response: status=%d headers=%v cookies=%v writes=%d/%d/%d", writer.status, writer.headers, writer.setCookies, writer.writeJSONCalls, writer.writeStringCalls, writer.writeBytesCalls)
+			}
+		})
+	}
+}
+
+func TestSerializeCookieValidated_RejectsInvalidCookieContractValues(t *testing.T) {
+	tests := []struct {
+		name   string
+		cookie httpx.Cookie
+	}{
+		{name: "empty name", cookie: httpx.Cookie{Value: "value"}},
+		{name: "unknown same site", cookie: httpx.Cookie{Name: "session", Value: "value", SameSite: httpx.SameSite("Flexible")}},
+		{name: "unknown priority", cookie: httpx.Cookie{Name: "session", Value: "value", Priority: "Urgent"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if cookie, err := serializeCookieValidated(tt.cookie); err == nil {
+				t.Fatalf("invalid cookie contract value must fail, got %q", cookie)
+			}
+		})
+	}
+}
+
+func TestSerializeCookieValidated_AcceptsDocumentedCookieContractValues(t *testing.T) {
+	for _, sameSite := range []httpx.SameSite{"", httpx.SameSiteLax, httpx.SameSiteStrict, httpx.SameSiteNone} {
+		for _, priority := range []string{"", "Low", "Medium", "High"} {
+			cookie, err := serializeCookieValidated(httpx.Cookie{
+				Name:     "session",
+				Value:    "value",
+				SameSite: sameSite,
+				Priority: priority,
+			})
+			if err != nil {
+				t.Fatalf("documented values must remain valid (SameSite=%q Priority=%q): %v", sameSite, priority, err)
+			}
+			if cookie == "" {
+				t.Fatal("valid cookie must serialize to a non-empty value")
+			}
+		}
 	}
 }
 
@@ -251,6 +377,9 @@ func TestRedirectReturnValueHandler_Handle(t *testing.T) {
 	}
 	if len(writer.setCookies) != 1 {
 		t.Fatalf("쿠키가 기록되어야 합니다: %v", writer.setCookies)
+	}
+	if writer.setCookies[0] != "session=abc; Path=/; Expires=Tue, 14 Nov 2023 22:13:20 UTC; HttpOnly; Secure; SameSite=Lax" {
+		t.Fatalf("정상 리다이렉트 쿠키가 보존되지 않았습니다: %v", writer.setCookies)
 	}
 
 	ptrRedirect := &httpx.Redirect{Location: "/home"}

@@ -10,7 +10,7 @@ import (
 type DTOResolver struct{}
 
 func (r *DTOResolver) Supports(pm ParameterMeta) bool {
-	// ExecutionContext 제외
+	// 실행 컨텍스트 제외
 	if pm.Type == reflect.TypeFor[core.ExecutionContext]() {
 		return false
 	}

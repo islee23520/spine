@@ -92,7 +92,7 @@ func newTestHandlerFromAppWithOptions(t *testing.T, app spine.App, opts boot.Opt
 		t.Fatalf("spine 앱 시작 타임아웃")
 	}
 
-	// Transport hook은 라우트 마운트 이전에 호출될 수 있으므로,
+	// 전송 훅은 라우트 마운트 이전에 호출될 수 있으므로,
 	// 테스트에서는 마운트 완료 시점까지 짧게 대기해 404 레이스를 제거한다.
 	deadline := time.Now().Add(3 * time.Second)
 	for {

@@ -2,22 +2,22 @@ package header
 
 import "net/http"
 
-// Values represent the HTTP header type
+// Values는 HTTP 헤더를 나타내는 타입입니다.
 type Values struct {
 	headers http.Header
 }
 
-// NewValues creates a new Values instance with headers
+// NewValues는 주어진 헤더로 새 Values 인스턴스를 생성합니다.
 func NewValues(headers http.Header) Values {
 	return Values{headers: headers}
 }
 
-// Get returns Header value using key
+// Get은 키에 해당하는 헤더 값을 반환합니다.
 func (h Values) Get(key string) string {
 	return h.headers.Get(key)
 }
 
-// Has checks the key is existing
+// Has는 키에 해당하는 헤더가 있는지 확인합니다.
 func (h Values) Has(key string) bool {
 	return h.headers.Get(key) != ""
 }

@@ -2,7 +2,9 @@ package ws
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -142,6 +144,119 @@ func TestRuntime_ConcurrentSendsRemainSafeWhilePingRuns(t *testing.T) {
 		if err != nil {
 			t.Fatalf("동시 전송 실패: %v", err)
 		}
+	}
+}
+
+func TestRuntime_TrackConnHonorsConnectionLimit(t *testing.T) {
+	runtime := &Runtime{
+		options: normalizedWebSocketOptions{MaxConnections: 1},
+		ctx:     context.Background(),
+		conns:   make(map[string]*trackedConn),
+	}
+	if reserved, _ := runtime.reserveConnectionSlot(); !reserved {
+		t.Fatal("first connection should be accepted")
+	}
+	if reserved, _ := runtime.reserveConnectionSlot(); reserved {
+		t.Fatal("connection above the configured limit must be rejected")
+	}
+}
+
+func TestRuntime_RejectsCapacityBeforeWebSocketUpgrade(t *testing.T) {
+	controller := &cancellationController{
+		started:  make(chan struct{}),
+		canceled: make(chan struct{}),
+		release:  make(chan struct{}),
+	}
+	runtime, registration := newTestRuntime(t, controller, (*cancellationController).Wait, boot.WebSocketOptions{
+		MaxConnections:     1,
+		CapacityRetryAfter: 3 * time.Second,
+	})
+	defer runtime.Stop()
+	defer close(controller.release)
+
+	server := newRuntimeTestServer(runtime, registration)
+	defer server.Close()
+	first := dialRuntimeTestServer(t, server)
+	defer first.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	_, response, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err == nil {
+		t.Fatal("connection above capacity must be rejected")
+	}
+	if response == nil || response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("capacity rejection must return HTTP 503 before upgrade: %v", response)
+	}
+	defer response.Body.Close()
+	if got := response.Header.Get("Retry-After"); got != "3" {
+		t.Fatalf("Retry-After = %q, want 3", got)
+	}
+}
+
+func TestRuntime_ReleasesCapacityAfterFailedUpgrade(t *testing.T) {
+	runtime, registration := newTestRuntime(t, &cancellationController{}, (*cancellationController).Wait, boot.WebSocketOptions{
+		MaxConnections: 1,
+	})
+	defer runtime.Stop()
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "http://example.test/", nil)
+	runtime.HandleConn(recorder, request, registration)
+
+	if reserved, _ := runtime.reserveConnectionSlot(); !reserved {
+		t.Fatal("failed WebSocket upgrade must release its reserved connection slot")
+	}
+	runtime.releaseConnectionSlot()
+}
+
+func TestIsAllowedWebSocketOrigin_RejectsSameHostCrossSchemeOrigin(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "https://example.test/ws", nil)
+	req.Host = "example.test"
+	req.TLS = &tls.ConnectionState{}
+	req.Header.Set("Origin", "http://example.test")
+	if isAllowedWebSocketOrigin(req, nil) {
+		t.Fatal("secure endpoint must reject a same-host HTTP origin")
+	}
+	req.Header.Set("Origin", "https://example.test")
+	if !isAllowedWebSocketOrigin(req, nil) {
+		t.Fatal("secure endpoint must allow an exact same-origin request")
+	}
+}
+
+func TestIsAllowedWebSocketOrigin_TrustsForwardedProtoOnlyFromConfiguredProxy(t *testing.T) {
+	_, trustedNetwork, err := net.ParseCIDR("10.0.0.0/8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "http://example.test/ws", nil)
+	req.Host = "example.test"
+	req.Header.Set("Origin", "https://example.test")
+	req.Header.Set("Forwarded", "for=192.0.2.10;proto=https;host=example.test")
+
+	req.RemoteAddr = "203.0.113.5:1234"
+	if isAllowedWebSocketOriginWithTrustedProxies(req, nil, []*net.IPNet{trustedNetwork}) {
+		t.Fatal("forwarding headers from an untrusted peer must be ignored")
+	}
+
+	req.RemoteAddr = "10.1.2.3:1234"
+	if !isAllowedWebSocketOriginWithTrustedProxies(req, nil, []*net.IPNet{trustedNetwork}) {
+		t.Fatal("Forwarded proto from a trusted proxy must determine the public request scheme")
+	}
+
+	req.Header.Del("Forwarded")
+	req.Header.Set("X-Forwarded-Proto", "https")
+	if !isAllowedWebSocketOriginWithTrustedProxies(req, nil, []*net.IPNet{trustedNetwork}) {
+		t.Fatal("X-Forwarded-Proto from a trusted proxy must be used as a fallback")
+	}
+}
+
+func TestIsAllowedWebSocketOrigin_ExplicitAllowedOriginDoesNotRequireTrustedProxy(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "http://internal.test/ws", nil)
+	req.Host = "internal.test"
+	req.RemoteAddr = "203.0.113.5:1234"
+	req.Header.Set("Origin", "https://app.example.test")
+	if !isAllowedWebSocketOriginWithTrustedProxies(req, []string{"https://app.example.test"}, nil) {
+		t.Fatal("explicit AllowedOrigins must remain authoritative")
 	}
 }
 

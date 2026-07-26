@@ -2,6 +2,7 @@ package kafka
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 
 	"github.com/NARUBROWN/spine/internal/event/consumer"
@@ -15,29 +16,57 @@ type Reader struct {
 }
 
 func NewKafkaReader(topic string, opts boot.KafkaOptions) (*Reader, error) {
-	if len(opts.Brokers) == 0 {
-		return nil, errors.New("Kafka brokers are not configured")
-	}
 	if opts.Read == nil {
 		return nil, errors.New("Kafka read options are not configured")
 	}
-	if opts.Read.GroupID == "" {
-		return nil, errors.New("Kafka read group ID cannot be empty")
-	}
 	if topic == "" {
 		return nil, errors.New("Kafka topic cannot be empty")
+	}
+	if err := opts.Validate(); err != nil {
+		return nil, err
 	}
 
 	reader := kafka.NewReader(kafka.ReaderConfig{
 		Brokers: opts.Brokers,
 		Topic:   topic,
 		GroupID: opts.Read.GroupID,
+		Dialer:  effectiveDialer(opts),
 	})
 
 	return &Reader{
 		reader: reader,
 		opts:   opts,
 	}, nil
+}
+
+func effectiveDialer(opts boot.KafkaOptions) *kafka.Dialer {
+	tlsConfig := effectiveTLSConfig(opts)
+	if opts.Dialer != nil {
+		dialer := *opts.Dialer
+		if dialer.TLS == nil && tlsConfig != nil {
+			dialer.TLS = tlsConfig
+		}
+		return &dialer
+	}
+	if tlsConfig == nil {
+		return nil
+	}
+	// kafka-go의 암묵적 기본값에는 10초 제한 시간과 DualStack 설정이 포함됩니다.
+	// Spine이 공유 TLS만 주입할 때도 이 기본 동작을 유지하고,
+	// 패키지 수준의 DefaultDialer는 변경하지 않습니다.
+	dialer := *kafka.DefaultDialer
+	dialer.TLS = tlsConfig
+	return &dialer
+}
+
+func effectiveTLSConfig(opts boot.KafkaOptions) *tls.Config {
+	if opts.TLS != nil {
+		return opts.TLS.Clone()
+	}
+	if opts.AllowInsecureTransport {
+		return nil
+	}
+	return &tls.Config{MinVersion: tls.VersionTLS12}
 }
 
 func (r *Reader) Read(ctx context.Context) (*consumer.Message, error) {

@@ -6,7 +6,7 @@ type HTTPError struct {
 	Cause   error
 }
 
-// error 인터페이스의 계약 구현
+// 오류 인터페이스의 계약 구현
 func (e *HTTPError) Error() string {
 	return e.Message
 }

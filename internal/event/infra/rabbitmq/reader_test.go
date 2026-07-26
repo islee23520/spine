@@ -46,6 +46,18 @@ func TestNewRabbitMqReader_Validation(t *testing.T) {
 	}
 }
 
+func TestValidateBrokerURL_RequiresAMQPSByDefault(t *testing.T) {
+	if err := validateBrokerURL("amqp://guest:guest@localhost:5672/", false); err == nil {
+		t.Fatal("plaintext AMQP must require an explicit insecure-development opt-in")
+	}
+	if err := validateBrokerURL("amqp://guest:guest@localhost:5672/", true); err != nil {
+		t.Fatalf("explicit insecure-development opt-in should be accepted: %v", err)
+	}
+	if err := validateBrokerURL("amqps://broker.example:5671/", false); err != nil {
+		t.Fatalf("AMQPS should be accepted: %v", err)
+	}
+}
+
 func TestReader_ReadContextCanceled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -74,7 +86,7 @@ func TestReader_ReadBuildsMessageAndAckNack(t *testing.T) {
 	msgs <- amqp091.Delivery{
 		Acknowledger: ack,
 		DeliveryTag:  7,
-		Type:         "order.created",
+		Type:         "untrusted.type",
 		Body:         []byte(`{"id":1}`),
 		RoutingKey:   "orders.created",
 	}
@@ -85,7 +97,7 @@ func TestReader_ReadBuildsMessageAndAckNack(t *testing.T) {
 		t.Fatalf("Read 실패: %v", err)
 	}
 
-	if msg.EventName != "order.created" {
+	if msg.EventName != "orders.created" {
 		t.Fatalf("event name이 잘못되었습니다: %s", msg.EventName)
 	}
 	if string(msg.Payload) != `{"id":1}` {
@@ -93,6 +105,9 @@ func TestReader_ReadBuildsMessageAndAckNack(t *testing.T) {
 	}
 	if msg.Metadata["routing_key"] != "orders.created" {
 		t.Fatalf("metadata가 잘못되었습니다: %+v", msg.Metadata)
+	}
+	if msg.Metadata["amqp_type"] != "untrusted.type" || msg.Metadata["dispatch_key"] != "orders.created" {
+		t.Fatalf("dispatch diagnostics metadata is incomplete: %+v", msg.Metadata)
 	}
 
 	if err := msg.Ack(); err != nil {
@@ -105,8 +120,41 @@ func TestReader_ReadBuildsMessageAndAckNack(t *testing.T) {
 	if err := msg.Nack(); err != nil {
 		t.Fatalf("Nack 실패: %v", err)
 	}
-	if !ack.nackCalled || ack.nackTag != 7 || ack.nackMultiple || !ack.nackRequeue {
+	if !ack.nackCalled || ack.nackTag != 7 || ack.nackMultiple || ack.nackRequeue {
 		t.Fatalf("Nack 매핑이 잘못되었습니다: %+v", ack)
+	}
+}
+
+func TestEffectiveFailurePolicyPreservesLegacyRequeue(t *testing.T) {
+	if got := effectiveFailurePolicy(&RabbitMqReadOptions{RequeueOnError: true}); got != RabbitMqFailureRequeue {
+		t.Fatalf("legacy RequeueOnError should map to requeue, got %q", got)
+	}
+	if got := effectiveFailurePolicy(&RabbitMqReadOptions{}); got != RabbitMqFailureReject {
+		t.Fatalf("default should reject poison messages, got %q", got)
+	}
+}
+
+func TestValidateReadOptionsRejectsPolicyConflictAndEmptyDLX(t *testing.T) {
+	base := RabbitMqReadOptions{Queue: "orders", RoutingKey: "orders.created"}
+	conflict := base
+	conflict.FailurePolicy = RabbitMqFailureReject
+	conflict.RequeueOnError = true
+	if err := validateReadOptions(&conflict); err == nil {
+		t.Fatal("conflicting legacy and explicit policies must fail")
+	}
+	emptyDLX := base
+	emptyDLX.DeadLetter = &RabbitMqDeadLetterOptions{}
+	if err := validateReadOptions(&emptyDLX); err == nil {
+		t.Fatal("empty dead-letter exchange must fail")
+	}
+}
+
+func TestValidateReadOptionsRequiresDerivedQueueAndRoutingKey(t *testing.T) {
+	if err := validateReadOptions(&RabbitMqReadOptions{RoutingKey: "orders.created"}); err == nil || !strings.Contains(err.Error(), "queue cannot be empty") {
+		t.Fatalf("empty queue should fail before dialing: %v", err)
+	}
+	if err := validateReadOptions(&RabbitMqReadOptions{Queue: "orders"}); err == nil || !strings.Contains(err.Error(), "routing key cannot be empty") {
+		t.Fatalf("empty routing key should fail before dialing: %v", err)
 	}
 }
 

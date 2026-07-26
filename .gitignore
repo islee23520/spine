@@ -1,4 +1,4 @@
-# Go build artifacts
+# Go 빌드 산출물
 *.exe
 *.exe~
 *.dll
@@ -8,21 +8,34 @@
 *.out
 *.prof
 
-# Binaries and build output
+# 실행 파일과 빌드 출력물
 bin/
 dist/
 
-# Coverage
+# 테스트 커버리지
 coverage/
 coverage*.out
 
-# Go workspace files
+# Go 워크스페이스 파일
 go.work
 go.work.sum
 
-# OS files
+# 운영체제 생성 파일
 .DS_Store
 .idea/
 
 .gocache
 .claude/
+
+docs/*
+!docs/migration/
+docs/migration/*
+!docs/migration/v0.5.md
+!docs/migration/v0.5.en.md
+!docs/security-configuration.md
+!docs/security-configuration.en.md
+
+examples/*
+!examples/security-config/
+examples/security-config/*
+!examples/security-config/main.go

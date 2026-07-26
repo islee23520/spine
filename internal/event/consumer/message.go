@@ -6,7 +6,7 @@ type Message struct {
 	Metadata  map[string]string
 
 	// ACK/NACK 콜백 함수 (선택적)
-	// Reader 구현체에서 설정하며, Runtime에서 처리 결과에 따라 호출
+	// 리더 구현체에서 설정하며, 런타임에서 처리 결과에 따라 호출
 	ack  func() error
 	nack func() error
 }
@@ -27,12 +27,12 @@ func (m *Message) Nack() error {
 	return nil
 }
 
-// SetAckHandler는 ACK 콜백 함수를 설정합니다 (Reader 구현체용).
+// SetAckHandler는 ACK 콜백 함수를 설정합니다(리더 구현체용).
 func (m *Message) SetAckHandler(ack func() error) {
 	m.ack = ack
 }
 
-// SetNackHandler는 NACK 콜백 함수를 설정합니다 (Reader 구현체용).
+// SetNackHandler는 NACK 콜백 함수를 설정합니다(리더 구현체용).
 func (m *Message) SetNackHandler(nack func() error) {
 	m.nack = nack
 }

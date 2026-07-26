@@ -15,8 +15,8 @@ type EventBusCarrier interface {
 
 /*
 ExecutionContext
-- Pipeline / Router 전용
-- HTTP Transport 실행 흐름에서만 사용
+- 파이프라인과 라우터 전용
+- HTTP 전송 실행 흐름에서만 사용
 */
 type ExecutionContext interface {
 	ContextCarrier
@@ -34,9 +34,9 @@ type ExecutionContext interface {
 
 /*
 ControllerContext
-- Controller 전용 Context View
-- ExecutionContext의 읽기 전용 Facade
-- Interceptor에서 주입한 값을 Controller에서 참조하기 위한 공식 통로
+- 컨트롤러 전용 컨텍스트 뷰
+- ExecutionContext의 읽기 전용 퍼사드
+- 인터셉터에서 주입한 값을 컨트롤러에서 참조하는 공식 통로
 */
 type ControllerContext interface {
 	Get(key string) (any, bool)
@@ -44,7 +44,7 @@ type ControllerContext interface {
 
 /*
 HttpRequestContext
-- HTTP 전용 Context 계약
+- HTTP 전용 컨텍스트 계약
 */
 type HttpRequestContext interface {
 	ContextCarrier
@@ -60,16 +60,16 @@ type HttpRequestContext interface {
 	Queries() map[string][]string
 	Headers() map[string][]string
 
-	// body
+	// 요청 본문
 	Bind(out any) error
 
-	// Multipart
+	// 멀티파트
 	MultipartForm() (*multipart.Form, error)
 }
 
 /*
 ConsumerRequestContext
-- Event Consumer 전용 Context
+- 이벤트 컨슈머 전용 컨텍스트
 */
 type ConsumerRequestContext interface {
 	ContextCarrier

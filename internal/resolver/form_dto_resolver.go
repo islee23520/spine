@@ -36,7 +36,7 @@ func (r *FormDTOResolver) Resolve(ctx core.ExecutionContext, parameterMeta Param
 
 	dto := reflect.New(parameterMeta.Type.Elem()).Interface()
 
-	// Echo의 Form 바인딩 위임
+	// Echo의 폼 바인딩에 위임
 	if err := httpCtx.Bind(dto); err != nil {
 		return nil, err
 	}

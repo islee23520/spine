@@ -75,12 +75,17 @@ func (h *JSONReturnHandler) Handle(value any, ctx core.ExecutionContext) error {
 		return fmt.Errorf("invalid ResponseWriter type")
 	}
 
+	serializedCookies, err := serializeCookiesValidated(options.Cookies)
+	if err != nil {
+		return fmt.Errorf("JSONReturnHandler: %w", err)
+	}
+
 	for k, v := range options.Headers {
 		rw.SetHeader(k, v)
 	}
 
-	for _, c := range options.Cookies {
-		rw.AddHeader("Set-Cookie", serializeCookie(c))
+	for _, cookie := range serializedCookies {
+		rw.AddHeader("Set-Cookie", cookie)
 	}
 
 	status := options.Status

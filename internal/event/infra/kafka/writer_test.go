@@ -2,6 +2,7 @@ package kafka
 
 import (
 	"context"
+	"crypto/tls"
 	"testing"
 	"time"
 
@@ -12,6 +13,25 @@ import (
 
 type fakeKafkaWriter struct {
 	messages []kafka.Message
+}
+
+func TestEffectiveTransportUsesSharedTLSWithoutMutatingOverride(t *testing.T) {
+	shared := &tls.Config{MinVersion: tls.VersionTLS12, ServerName: "broker.example"}
+	override := &kafka.Transport{ClientID: "advanced", MetadataTopics: []string{"orders"}}
+	transport := effectiveTransport(boot.KafkaOptions{TLS: shared, Transport: override})
+	if transport == override || transport.TLS == shared || transport.TLS.ServerName != "broker.example" {
+		t.Fatalf("shared TLS should be cloned into a cloned override: %#v", transport)
+	}
+	if transport.ClientID != "advanced" || len(transport.MetadataTopics) != 1 || transport.MetadataTopics[0] != "orders" {
+		t.Fatalf("advanced transport settings must be preserved: %#v", transport)
+	}
+	transport.MetadataTopics[0] = "changed"
+	if override.MetadataTopics[0] != "orders" {
+		t.Fatal("advanced override slices must not be aliased")
+	}
+	if override.TLS != nil {
+		t.Fatal("advanced override must not be mutated")
+	}
 }
 
 func (w *fakeKafkaWriter) WriteMessages(ctx context.Context, msgs ...kafka.Message) error {
@@ -59,5 +79,40 @@ func TestNewKafkaPublisher_RequiresWriteOptions(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("Write 옵션 누락 시 에러가 발생해야 합니다")
+	}
+}
+
+func TestNewKafkaPublisher_UsesImplicitSecureTransportByDefault(t *testing.T) {
+	publisher, err := NewKafkaPublisher(&boot.KafkaOptions{
+		Brokers: []string{"localhost:9092"},
+		Write:   &boot.KafkaWriteOptions{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport, ok := publisher.Writer.Transport.(*kafka.Transport)
+	if !ok || transport.TLS == nil || transport.TLS.MinVersion != tls.VersionTLS12 {
+		t.Fatalf("publisher must use Spine's implicit TLS 1.2+ transport: %#v", publisher.Writer.Transport)
+	}
+}
+
+func TestKafkaPublisher_InsecureDefaultTransportDoesNotPanicOnWriteMessages(t *testing.T) {
+	publisher, err := NewKafkaPublisher(&boot.KafkaOptions{
+		Brokers:                []string{"127.0.0.1:1"},
+		AllowInsecureTransport: true,
+		Write:                  &boot.KafkaWriteOptions{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if publisher.Writer.Transport != nil {
+		t.Fatalf("insecure default must leave kafka-go transport unset, got %#v", publisher.Writer.Transport)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err = publisher.Publish(ctx, fakeDomainEvent{name: "orders.created", at: time.Unix(1700000000, 0)})
+	if err == nil {
+		t.Fatal("WriteMessages to an unavailable broker must return an error without panicking")
 	}
 }

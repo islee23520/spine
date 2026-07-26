@@ -61,10 +61,6 @@ func (c *UserController) CreateUser(ctx context.Context, req *CreateUserRequest)
 }
 
 func (c *UserController) GetUserQuery(ctx context.Context, q query.Values) httpx.Response[string] {
-	// user := User{
-	// 	ID:   q.Int("id", 0),
-	// 	Name: q.String("name"),
-	// }
 	return httpx.Response[string]{
 		Body: "OK",
 	}
@@ -129,13 +125,13 @@ func (c *UserController) CreateStock(ctx context.Context, stockId path.Int) http
 	}
 }
 
-// Headers represent the response DTO in CheckHeader.
+// Headers는 CheckHeader가 반환하는 응답 DTO입니다.
 type Headers struct {
 	UserAgent   string `json:"user_agent,omitempty"`
 	ContentType string `json:"content_type,omitempty"`
 }
 
-// CheckHeader returns UserAgent and ContentType information from the HTTP request header
+// CheckHeader는 HTTP 요청 헤더의 User-Agent와 Content-Type 정보를 반환합니다.
 func (c *CommonController) CheckHeader(headers header.Values) Headers {
 	return Headers{
 		UserAgent:   headers.Get("User-Agent"),

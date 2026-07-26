@@ -43,14 +43,19 @@ func (h *BinaryReturnHandler) Handle(value any, ctx core.ExecutionContext) error
 		return fmt.Errorf("invalid ResponseWriter type")
 	}
 
+	serializedCookies, err := serializeCookiesValidated(binary.Options.Cookies)
+	if err != nil {
+		return fmt.Errorf("BinaryReturnValueHandler: %w", err)
+	}
+
 	// 사용자 정의 헤더 설정
 	for k, v := range binary.Options.Headers {
 		rw.SetHeader(k, v)
 	}
 
 	// 쿠키 설정
-	for _, c := range binary.Options.Cookies {
-		rw.AddHeader("Set-Cookie", serializeCookie(c))
+	for _, cookie := range serializedCookies {
+		rw.AddHeader("Set-Cookie", cookie)
 	}
 
 	// Content-Type 설정

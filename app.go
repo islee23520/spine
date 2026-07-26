@@ -18,10 +18,14 @@ type App interface {
 	Route(method string, path string, handler any, opts ...router.RouteOption)
 	// 인터셉터 선언
 	Interceptor(interceptors ...core.Interceptor)
-	// HTTP Transport 확장 (Echo 등)
+	// InterceptorFor는 선택한 기본 전송 방식에 전역 인터셉터를 등록합니다.
+	InterceptorFor(scope boot.InterceptorScope, interceptors ...core.Interceptor)
+	// HTTP 전송 방식 확장(Echo 등)
 	Transport(fn func(any))
-	// 독립 실행되는 Custom Transport 등록
+	// 독립 실행되는 사용자 정의 전송 방식 등록
 	RegisterTransport(t core.CustomTransport)
+	// Validate는 네트워크 연결을 열지 않고 애플리케이션 설정을 검사합니다.
+	Validate(opts boot.Options) error
 	// 실행
 	Run(opts boot.Options) error
 	// 이벤트 소비자 레지스트리 반환
@@ -33,7 +37,7 @@ type App interface {
 type app struct {
 	constructors      []any
 	routes            []router.RouteSpec
-	interceptors      []core.Interceptor
+	interceptors      []bootstrap.InterceptorBinding
 	transportHooks    []func(any)
 	customTransports  []core.CustomTransport
 	consumerRegistry  *consumer.Registry
@@ -66,7 +70,16 @@ func (a *app) Route(method string, path string, handler any, opts ...router.Rout
 }
 
 func (a *app) Interceptor(interceptors ...core.Interceptor) {
-	a.interceptors = append(a.interceptors, interceptors...)
+	a.InterceptorFor(boot.InterceptorAll, interceptors...)
+}
+
+func (a *app) InterceptorFor(scope boot.InterceptorScope, interceptors ...core.Interceptor) {
+	for _, interceptor := range interceptors {
+		a.interceptors = append(a.interceptors, bootstrap.InterceptorBinding{
+			Interceptor: interceptor,
+			Scope:       scope,
+		})
+	}
 }
 
 func (a *app) Transport(fn func(any)) {
@@ -77,12 +90,12 @@ func (a *app) RegisterTransport(t core.CustomTransport) {
 	a.customTransports = append(a.customTransports, t)
 }
 
-func (a *app) Run(opts boot.Options) error {
-	internalConfig := bootstrap.Config{
+func (a *app) bootstrapConfig(opts boot.Options) bootstrap.Config {
+	return bootstrap.Config{
 		Address:                opts.Address,
 		Constructors:           a.constructors,
 		Routes:                 a.routes,
-		Interceptors:           a.interceptors,
+		ScopedInterceptors:     a.interceptors,
 		TransportHooks:         a.transportHooks,
 		CustomTransports:       a.customTransports,
 		EnableGracefulShutdown: opts.EnableGracefulShutdown,
@@ -93,8 +106,14 @@ func (a *app) Run(opts boot.Options) error {
 		WebSocketRegistry:      a.websocketRegistry,
 		HTTP:                   opts.HTTP,
 	}
+}
 
-	return bootstrap.Run(internalConfig)
+func (a *app) Validate(opts boot.Options) error {
+	return bootstrap.Validate(a.bootstrapConfig(opts))
+}
+
+func (a *app) Run(opts boot.Options) error {
+	return bootstrap.Run(a.bootstrapConfig(opts))
 }
 
 func (a *app) Consumers() *consumer.Registry {
