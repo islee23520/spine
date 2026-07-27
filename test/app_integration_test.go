@@ -1,10 +1,10 @@
 package test
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -61,6 +61,7 @@ func newTestHandlerFromAppWithOptions(t *testing.T, app spine.App, opts boot.Opt
 
 	ready := make(chan http.Handler, 1)
 	runErr := make(chan error, 1)
+	runCtx, cancelRun := context.WithCancel(context.Background())
 
 	app.Transport(func(v any) {
 		h, ok := v.(http.Handler)
@@ -80,7 +81,7 @@ func newTestHandlerFromAppWithOptions(t *testing.T, app spine.App, opts boot.Opt
 		if opts.HTTP == nil {
 			opts.HTTP = &boot.HTTPOptions{}
 		}
-		runErr <- app.Run(opts)
+		runErr <- app.RunContext(runCtx, opts)
 	}()
 
 	var h http.Handler
@@ -110,6 +111,8 @@ func newTestHandlerFromAppWithOptions(t *testing.T, app spine.App, opts boot.Opt
 	}
 
 	t.Cleanup(func() {
+		cancelRun()
+
 		stopped := false
 		select {
 		case <-runErr:
@@ -118,10 +121,6 @@ func newTestHandlerFromAppWithOptions(t *testing.T, app spine.App, opts boot.Opt
 		}
 
 		if !stopped {
-			if p, err := os.FindProcess(os.Getpid()); err == nil {
-				_ = p.Signal(os.Interrupt)
-			}
-
 			select {
 			case <-runErr:
 			case <-time.After(3 * time.Second):

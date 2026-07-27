@@ -436,6 +436,60 @@ func TestRun_CustomTransportFatalErrorShutsDownHTTPListener(t *testing.T) {
 	}
 }
 
+func TestRunContext_CancellationShutsDownHTTPListener(t *testing.T) {
+	reserved, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve HTTP address: %v", err)
+	}
+	address := reserved.Addr().String()
+	if err := reserved.Close(); err != nil {
+		t.Fatalf("release reserved HTTP address: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- RunContext(ctx, Config{
+			Address:                address,
+			HTTP:                   &boot.HTTPOptions{},
+			EnableGracefulShutdown: true,
+			ShutdownTimeout:        time.Second,
+		})
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		conn, dialErr := net.DialTimeout("tcp", address, 20*time.Millisecond)
+		if dialErr == nil {
+			_ = conn.Close()
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatal("HTTP listener did not start")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	cancel()
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("RunContext returned an error after cancellation: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("RunContext did not return after cancellation")
+	}
+
+	reused, err := net.Listen("tcp", address)
+	if err != nil {
+		t.Fatalf("HTTP address was not reusable after RunContext returned: %v", err)
+	}
+	if err := reused.Close(); err != nil {
+		t.Fatalf("close reused HTTP listener: %v", err)
+	}
+}
+
 func TestWaitConsumerError_DrainsFatalErrorWhenDoneIsAlsoReady(t *testing.T) {
 	errorsCh := make(chan error, 1)
 	done := make(chan struct{})

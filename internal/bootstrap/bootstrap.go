@@ -79,10 +79,17 @@ func (f *containerFacade) Resolve(t reflect.Type) (any, error) {
 }
 
 func Run(config Config) error {
+	return RunContext(context.Background(), config)
+}
+
+func RunContext(ctx context.Context, config Config) error {
 	if err := Validate(config); err != nil {
 		return err
 	}
-	runCtx, cancelRun := context.WithCancel(context.Background())
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	runCtx, cancelRun := context.WithCancel(ctx)
 	defer cancelRun()
 
 	// 어떤 전송 방식도 초기화하거나 노출하기 전에 종료 신호를 구독합니다.
@@ -102,6 +109,7 @@ func Run(config Config) error {
 				cancelRun()
 				close(requested)
 			case <-runCtx.Done():
+				close(requested)
 			}
 		}()
 	}
@@ -589,6 +597,8 @@ func Run(config Config) error {
 				return err
 			case err := <-customTransportErrCh:
 				return err
+			case <-runCtx.Done():
+				return cleanup()
 			}
 		}
 

@@ -1,6 +1,7 @@
 package spine
 
 import (
+	"context"
 	"strings"
 
 	"github.com/NARUBROWN/spine/core"
@@ -28,6 +29,8 @@ type App interface {
 	Validate(opts boot.Options) error
 	// 실행
 	Run(opts boot.Options) error
+	// RunContext는 context가 취소될 때 정상 종료를 시작합니다.
+	RunContext(ctx context.Context, opts boot.Options) error
 	// 이벤트 소비자 레지스트리 반환
 	Consumers() *consumer.Registry
 	// 웹 소켓 레지스트리 반환
@@ -114,6 +117,10 @@ func (a *app) Validate(opts boot.Options) error {
 
 func (a *app) Run(opts boot.Options) error {
 	return bootstrap.Run(a.bootstrapConfig(opts))
+}
+
+func (a *app) RunContext(ctx context.Context, opts boot.Options) error {
+	return bootstrap.RunContext(ctx, a.bootstrapConfig(opts))
 }
 
 func (a *app) Consumers() *consumer.Registry {
