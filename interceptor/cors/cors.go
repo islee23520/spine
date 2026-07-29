@@ -118,8 +118,9 @@ func (i *CORSInterceptor) PreHandle(
 		rw.SetHeader("Access-Control-Allow-Credentials", "true")
 	}
 
-	// 사전 요청 처리
-	if ctx.Method() == "OPTIONS" {
+	// Origin과 대상 메서드가 있는 실제 CORS 사전 요청만 여기서 종료한다.
+	// 일반 OPTIONS 요청은 등록된 애플리케이션 핸들러로 전달한다.
+	if ctx.Method() == "OPTIONS" && origin != "" && ctx.Header("Access-Control-Request-Method") != "" {
 		rw.WriteStatus(204)
 		return core.ErrAbortPipeline
 	}

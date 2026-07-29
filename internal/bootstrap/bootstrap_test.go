@@ -263,6 +263,29 @@ func TestValidate_RejectsNegativeShutdownTimeout(t *testing.T) {
 	}
 }
 
+func TestValidate_RejectsInvalidRouteHandlers(t *testing.T) {
+	err := Validate(Config{
+		HTTP: &boot.HTTPOptions{},
+		Routes: []spineRouter.RouteSpec{
+			{Method: "GET", Path: "/nil", Handler: nil},
+			{Method: "GET", Path: "/value", Handler: "not a method"},
+		},
+	})
+	configErr, ok := err.(*boot.ConfigError)
+	if !ok {
+		t.Fatalf("Validate error = %T, want *boot.ConfigError", err)
+	}
+	if len(configErr.Issues) != 2 {
+		t.Fatalf("unexpected validation issues: %+v", configErr.Issues)
+	}
+	for i, issue := range configErr.Issues {
+		wantPath := fmt.Sprintf("Routes[%d].Handler", i)
+		if issue.Path != wantPath || issue.Code != "HTTP_ROUTE_HANDLER_INVALID" {
+			t.Fatalf("unexpected route issue: %+v", issue)
+		}
+	}
+}
+
 func TestRun_DoesNotExposeHTTPListenerBeforeConsumerWarmUpSucceeds(t *testing.T) {
 	reserved, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -562,9 +585,9 @@ func TestValidate_RejectsInvalidInterceptorScopeBeforeStartup(t *testing.T) {
 	}
 }
 
-func TestSpineVersionMatchesV051Release(t *testing.T) {
-	if spineVersion != "v0.5.1" {
-		t.Fatalf("runtime version = %q, want v0.5.1", spineVersion)
+func TestSpineVersionMatchesV052Release(t *testing.T) {
+	if spineVersion != "v0.5.2" {
+		t.Fatalf("runtime version = %q, want v0.5.2", spineVersion)
 	}
 }
 

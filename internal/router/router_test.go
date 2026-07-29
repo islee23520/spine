@@ -11,6 +11,12 @@ import (
 	"github.com/NARUBROWN/spine/pkg/httperr"
 )
 
+func TestNewHandlerMeta_RejectsNilWithoutPanic(t *testing.T) {
+	if _, err := NewHandlerMeta(nil); err == nil {
+		t.Fatal("nil handler는 오류여야 합니다")
+	}
+}
+
 type testEventBus struct{}
 
 func (b *testEventBus) Publish(events ...publish.DomainEvent) {}

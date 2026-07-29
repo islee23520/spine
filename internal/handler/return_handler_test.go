@@ -378,7 +378,7 @@ func TestRedirectReturnValueHandler_Handle(t *testing.T) {
 	if len(writer.setCookies) != 1 {
 		t.Fatalf("쿠키가 기록되어야 합니다: %v", writer.setCookies)
 	}
-	if writer.setCookies[0] != "session=abc; Path=/; Expires=Tue, 14 Nov 2023 22:13:20 UTC; HttpOnly; Secure; SameSite=Lax" {
+	if writer.setCookies[0] != "session=abc; Path=/; Expires=Tue, 14 Nov 2023 22:13:20 GMT; HttpOnly; Secure; SameSite=Lax" {
 		t.Fatalf("정상 리다이렉트 쿠키가 보존되지 않았습니다: %v", writer.setCookies)
 	}
 
@@ -388,6 +388,17 @@ func TestRedirectReturnValueHandler_Handle(t *testing.T) {
 	}
 	if writer.headers["Location"] != "/home" {
 		t.Fatalf("포인터 redirect location이 잘못되었습니다: %v", writer.headers)
+	}
+}
+
+func TestSerializeCookieValidated_ClearCookieUsesPortableExpiration(t *testing.T) {
+	cookie, err := serializeCookieValidated(httpx.ClearAccessTokenCookie())
+	if err != nil {
+		t.Fatalf("삭제 쿠키 직렬화 실패: %v", err)
+	}
+	want := "accessToken=; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:01 GMT"
+	if cookie != want {
+		t.Fatalf("삭제 쿠키가 즉시 만료 형식이어야 합니다: got %q want %q", cookie, want)
 	}
 }
 

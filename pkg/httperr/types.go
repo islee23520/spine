@@ -11,6 +11,10 @@ func (e *HTTPError) Error() string {
 	return e.Message
 }
 
+func (e *HTTPError) Unwrap() error {
+	return e.Cause
+}
+
 func NotFound(msg string) error {
 	return &HTTPError{Status: 404, Message: msg}
 }

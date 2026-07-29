@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"reflect"
 	"strings"
-	"time"
 
 	"github.com/NARUBROWN/spine/core"
 	"github.com/NARUBROWN/spine/pkg/httpx"
@@ -106,11 +105,13 @@ func serializeCookieValidated(c httpx.Cookie) (string, error) {
 		}
 		parts = append(parts, "Domain="+c.Domain)
 	}
-	if c.MaxAge != 0 {
+	if c.MaxAge > 0 {
 		parts = append(parts, fmt.Sprintf("Max-Age=%d", c.MaxAge))
+	} else if c.MaxAge < 0 {
+		parts = append(parts, "Max-Age=0")
 	}
 	if c.Expires != nil {
-		parts = append(parts, "Expires="+c.Expires.UTC().Format(time.RFC1123))
+		parts = append(parts, "Expires="+c.Expires.UTC().Format(http.TimeFormat))
 	}
 	if c.HttpOnly {
 		parts = append(parts, "HttpOnly")

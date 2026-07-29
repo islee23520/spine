@@ -2,11 +2,14 @@ package echo
 
 import (
 	"context"
+	"errors"
 	"maps"
 	"mime/multipart"
+	"net/http"
 
 	"github.com/NARUBROWN/spine/core"
 	"github.com/NARUBROWN/spine/internal/event/publish"
+	"github.com/NARUBROWN/spine/pkg/httperr"
 	"github.com/labstack/echo/v4"
 )
 
@@ -29,7 +32,7 @@ func (e *echoContext) Context() context.Context {
 }
 
 func (e *echoContext) Bind(out any) error {
-	return e.echo.Bind(out)
+	return normalizeRequestError(e.echo.Bind(out))
 }
 
 func (e *echoContext) Get(key string) (any, bool) {
@@ -125,7 +128,32 @@ func (e *echoContext) PathKeys() []string {
 }
 
 func (e *echoContext) MultipartForm() (*multipart.Form, error) {
-	return e.echo.MultipartForm()
+	form, err := e.echo.MultipartForm()
+	return form, normalizeRequestError(err)
+}
+
+// normalizeRequestError는 Echo의 전송 계층 오류를 Spine의 공개 HTTP 오류로 바꿉니다.
+// 요청 크기 초과 오류는 파이프라인에서 413으로 처리할 수 있도록 원형을 유지합니다.
+func normalizeRequestError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var maxBytesErr *http.MaxBytesError
+	if errors.As(err, &maxBytesErr) {
+		return maxBytesErr
+	}
+	var echoErr *echo.HTTPError
+	if errors.As(err, &echoErr) {
+		if echoErr.Code < 400 || echoErr.Code >= 500 {
+			return err
+		}
+		message := http.StatusText(echoErr.Code)
+		if message == "" {
+			message = "Invalid request"
+		}
+		return &httperr.HTTPError{Status: echoErr.Code, Message: message, Cause: err}
+	}
+	return &httperr.HTTPError{Status: http.StatusBadRequest, Message: http.StatusText(http.StatusBadRequest), Cause: err}
 }
 
 func (c *echoContext) EventBus() publish.EventBus {

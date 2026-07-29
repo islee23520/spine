@@ -13,6 +13,7 @@ import (
 	"github.com/NARUBROWN/spine/core"
 	eventpublish "github.com/NARUBROWN/spine/pkg/event/publish"
 	"github.com/NARUBROWN/spine/pkg/header"
+	"github.com/NARUBROWN/spine/pkg/httperr"
 	pkgmultipart "github.com/NARUBROWN/spine/pkg/multipart"
 	"github.com/NARUBROWN/spine/pkg/path"
 	"github.com/NARUBROWN/spine/pkg/query"
@@ -125,6 +126,23 @@ func TestPathIntResolver_InvalidBool(t *testing.T) {
 	_, err := r.Resolve(ctx, pm)
 	if err == nil {
 		t.Fatal("잘못된 불리언은 에러여야 합니다")
+	}
+	var httpErr *httperr.HTTPError
+	if !errors.As(err, &httpErr) || httpErr.Status != 400 {
+		t.Fatalf("잘못된 경로 불리언은 400 오류여야 합니다: %T %v", err, err)
+	}
+}
+
+func TestPathIntResolver_InvalidValueReturnsBadRequest(t *testing.T) {
+	r := &PathIntResolver{}
+	pm := ParameterMeta{Type: reflect.TypeFor[path.Int](), PathKey: "id"}
+	ctx := newFakeHttpCtx()
+	ctx.params["id"] = "not-an-int"
+
+	_, err := r.Resolve(ctx, pm)
+	var httpErr *httperr.HTTPError
+	if !errors.As(err, &httpErr) || httpErr.Status != 400 {
+		t.Fatalf("잘못된 경로 정수는 400 오류여야 합니다: %T %v", err, err)
 	}
 }
 

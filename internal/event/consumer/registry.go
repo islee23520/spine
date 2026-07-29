@@ -16,11 +16,13 @@ type Registration struct {
 type Registry struct {
 	mu            sync.RWMutex
 	registrations []Registration
+	topics        map[string]struct{}
 }
 
 func NewRegistry() *Registry {
 	return &Registry{
 		registrations: make([]Registration, 0),
+		topics:        make(map[string]struct{}),
 	}
 }
 
@@ -40,10 +42,17 @@ func (r *Registry) Register(topic string, target any) error {
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.topics == nil {
+		r.topics = make(map[string]struct{})
+	}
+	if _, exists := r.topics[topic]; exists {
+		return fmt.Errorf("consumer: topic already registered: %s", topic)
+	}
 	r.registrations = append(r.registrations, Registration{
 		Topic: topic,
 		Meta:  meta,
 	})
+	r.topics[topic] = struct{}{}
 	return nil
 }
 

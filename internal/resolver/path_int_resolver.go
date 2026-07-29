@@ -2,10 +2,12 @@ package resolver
 
 import (
 	"fmt"
+	"net/http"
 	"reflect"
 	"strconv"
 
 	"github.com/NARUBROWN/spine/core"
+	"github.com/NARUBROWN/spine/pkg/httperr"
 	"github.com/NARUBROWN/spine/pkg/path"
 )
 
@@ -31,11 +33,11 @@ func (r *PathIntResolver) Resolve(ctx core.ExecutionContext, parameterMeta Param
 
 	value, err := strconv.ParseInt(raw, 10, 64)
 	if err != nil {
-		return nil, fmt.Errorf(
-			"invalid path parameter %s: %v",
-			parameterMeta.Type.Name(),
-			err,
-		)
+		return nil, &httperr.HTTPError{
+			Status:  http.StatusBadRequest,
+			Message: fmt.Sprintf("Invalid path parameter: %s", parameterMeta.PathKey),
+			Cause:   err,
+		}
 	}
 
 	return path.Int{Value: value}, nil

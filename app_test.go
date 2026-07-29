@@ -1,6 +1,7 @@
 package spine
 
 import (
+	"net/http"
 	"testing"
 
 	"github.com/NARUBROWN/spine/core"
@@ -13,6 +14,20 @@ func (*appTestInterceptor) PreHandle(core.ExecutionContext, core.HandlerMeta) er
 func (*appTestInterceptor) PostHandle(core.ExecutionContext, core.HandlerMeta)      {}
 func (*appTestInterceptor) BeforeResponse(core.ExecutionContext, core.HandlerMeta, error) error {
 	return nil
+}
+
+func TestAppValidateRejectsNilRouteHandler(t *testing.T) {
+	application := New()
+	application.Route(http.MethodGet, "/nil", nil)
+
+	err := application.Validate(boot.Options{HTTP: &boot.HTTPOptions{}})
+	configErr, ok := err.(*boot.ConfigError)
+	if !ok {
+		t.Fatalf("Validate error = %T, want *boot.ConfigError", err)
+	}
+	if len(configErr.Issues) != 1 || configErr.Issues[0].Path != "Routes[0].Handler" {
+		t.Fatalf("unexpected validation issues: %+v", configErr.Issues)
+	}
 }
 func (*appTestInterceptor) AfterCompletion(core.ExecutionContext, core.HandlerMeta, error) {
 }

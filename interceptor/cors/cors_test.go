@@ -72,6 +72,7 @@ func TestCORSInterceptor_PreflightAllowedOrigin(t *testing.T) {
 
 	ctx := newTestExecutionContext("OPTIONS")
 	ctx.headers["Origin"] = "https://app.example"
+	ctx.headers["Access-Control-Request-Method"] = "POST"
 
 	writer := newTestResponseWriter()
 	ctx.Set("spine.response_writer", writer)
@@ -98,6 +99,22 @@ func TestCORSInterceptor_PreflightAllowedOrigin(t *testing.T) {
 	}
 	if writer.headers["Access-Control-Allow-Headers"] != "Content-Type, Authorization" {
 		t.Fatalf("Allow-Headers 헤더가 잘못되었습니다: %v", writer.headers)
+	}
+}
+
+func TestCORSInterceptor_OrdinaryOptionsContinuesPipeline(t *testing.T) {
+	interceptor := New(Config{
+		AllowOrigins: []string{"https://app.example"},
+	})
+	ctx := newTestExecutionContext("OPTIONS")
+	writer := newTestResponseWriter()
+	ctx.Set("spine.response_writer", writer)
+
+	if err := interceptor.PreHandle(ctx, core.HandlerMeta{}); err != nil {
+		t.Fatalf("일반 OPTIONS 요청은 계속 진행해야 합니다: %v", err)
+	}
+	if writer.status != 0 {
+		t.Fatalf("일반 OPTIONS 요청에 조기 응답하면 안 됩니다: %d", writer.status)
 	}
 }
 

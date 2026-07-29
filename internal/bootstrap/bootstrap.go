@@ -691,6 +691,16 @@ func Validate(config Config) error {
 		}
 		issues = append(issues, config.HTTP.ValidateIssues("HTTP")...)
 	}
+	for i, route := range config.Routes {
+		if _, err := spineRouter.NewHandlerMeta(route.Handler); err != nil {
+			issues = append(issues, boot.ConfigIssue{
+				Path:    fmt.Sprintf("Routes[%d].Handler", i),
+				Code:    "HTTP_ROUTE_HANDLER_INVALID",
+				Message: fmt.Sprintf("HTTP route handler is invalid: %v", err),
+				Hint:    "Provide a non-nil controller method expression such as (*Controller).Handle.",
+			})
+		}
+	}
 
 	bindings := make([]InterceptorBinding, 0, len(config.Interceptors)+len(config.ScopedInterceptors))
 	for _, interceptor := range config.Interceptors {
@@ -892,7 +902,7 @@ func waitConsumerError(errors <-chan error, done <-chan struct{}) error {
 }
 
 const (
-	spineVersion = "v0.5.1"
+	spineVersion = "v0.5.2"
 	spineBanner  = `
 ________       _____             
 __  ___/__________(_)___________ 

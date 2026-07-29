@@ -144,15 +144,8 @@ func (p *Pipeline) Execute(ctx core.ExecutionContext) (finalErr error) {
 
 	routeInterceptors = meta.Interceptors
 
-	paramMetas := buildParameterMeta(meta.Method, meta.PathKeys)
-
-	// 인자 리졸버 체인 실행
-	args, err := p.resolveArguments(ctx, paramMetas)
-	if err != nil {
-		return err
-	}
-
-	// 라우트 인터셉터의 사전 처리 실행
+	// 라우트 인터셉터는 요청 본문과 멀티파트를 읽기 전에 실행한다.
+	// 인증되지 않은 요청이 인자 해석 비용이나 부수 효과를 유발하면 안 된다.
 	for _, it := range routeInterceptors {
 		if err := it.PreHandle(ctx, meta); err != nil {
 			if errors.Is(err, core.ErrAbortPipeline) {
@@ -162,6 +155,14 @@ func (p *Pipeline) Execute(ctx core.ExecutionContext) (finalErr error) {
 			return err
 		}
 		routeFinalizers = append(routeFinalizers, it)
+	}
+
+	paramMetas := buildParameterMeta(meta.Method, meta.PathKeys)
+
+	// 인자 리졸버 체인 실행
+	args, err := p.resolveArguments(ctx, paramMetas)
+	if err != nil {
+		return err
 	}
 
 	// 컨트롤러 메서드 호출

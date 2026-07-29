@@ -14,6 +14,9 @@ import (
 func NewHandlerMeta(handler any) (core.HandlerMeta, error) {
 	t := reflect.TypeOf(handler)
 	v := reflect.ValueOf(handler)
+	if t == nil {
+		return core.HandlerMeta{}, fmt.Errorf("handler must not be nil")
+	}
 
 	// 1. 함수인지 검증
 	if t.Kind() != reflect.Func {

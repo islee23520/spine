@@ -41,3 +41,24 @@ func TestRegistry_RegisterReturnsErrorOnInvalidInput(t *testing.T) {
 		t.Fatal("nil target은 에러여야 합니다")
 	}
 }
+
+func TestRegistry_RegisterRejectsDuplicateTopic(t *testing.T) {
+	registry := NewRegistry()
+
+	if err := registry.Register("orders.created", (*registryTestController).Handle); err != nil {
+		t.Fatalf("첫 등록 실패: %v", err)
+	}
+	if err := registry.Register("orders.created", (*registryTestController).Handle); err == nil {
+		t.Fatal("같은 topic의 중복 등록은 에러여야 합니다")
+	}
+	if got := len(registry.Registrations()); got != 1 {
+		t.Fatalf("중복 등록 실패 후 기존 등록만 남아야 합니다: %d", got)
+	}
+}
+
+func TestRegistry_ZeroValueSupportsRegistration(t *testing.T) {
+	var registry Registry
+	if err := registry.Register("orders.created", (*registryTestController).Handle); err != nil {
+		t.Fatalf("Registry zero value 등록 실패: %v", err)
+	}
+}

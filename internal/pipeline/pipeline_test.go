@@ -397,9 +397,13 @@ func TestExecute_AbortByInterceptor(t *testing.T) {
 	p.router = &testRouter{meta: meta}
 	p.AddInterceptor(globalInterceptor)
 
+	resolverCalled := false
 	p.AddArgumentResolver(&testArgumentResolver{
 		supports: func(pm resolver.ParameterMeta) bool { return pm.Type.Kind() == reflect.Int },
-		resolve:  func(ctx core.ExecutionContext, pm resolver.ParameterMeta) (any, error) { return 1, nil },
+		resolve: func(ctx core.ExecutionContext, pm resolver.ParameterMeta) (any, error) {
+			resolverCalled = true
+			return 1, nil
+		},
 	})
 
 	err := p.Execute(newTestExecutionContext())
@@ -408,6 +412,9 @@ func TestExecute_AbortByInterceptor(t *testing.T) {
 	}
 	if controllerCalled != 0 {
 		t.Fatalf("중단 시 컨트롤러가 호출되면 안 됩니다. 실제 호출 횟수: %d", controllerCalled)
+	}
+	if resolverCalled {
+		t.Fatal("라우트 인터셉터가 중단한 요청의 인자를 해석하면 안 됩니다")
 	}
 
 	expected := []string{"pre:global", "pre:route", "before:global", "after:route", "after:global"}

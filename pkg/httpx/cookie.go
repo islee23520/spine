@@ -83,19 +83,23 @@ func DefaultRefreshTokenCookie(token string) Cookie {
 }
 
 func ClearAccessTokenCookie() Cookie {
+	expires := time.Unix(1, 0).UTC()
 	return Cookie{
-		Name:   AccessTokenCookieName,
-		Value:  "",
-		Path:   "/",
-		MaxAge: -1,
+		Name:    AccessTokenCookieName,
+		Value:   "",
+		Path:    "/",
+		MaxAge:  -1,
+		Expires: &expires,
 	}
 }
 
 func ClearRefreshTokenCookie() Cookie {
+	expires := time.Unix(1, 0).UTC()
 	return Cookie{
-		Name:   RefreshTokenCookieName,
-		Value:  "",
-		Path:   "/",
-		MaxAge: -1,
+		Name:    RefreshTokenCookieName,
+		Value:   "",
+		Path:    "/",
+		MaxAge:  -1,
+		Expires: &expires,
 	}
 }
