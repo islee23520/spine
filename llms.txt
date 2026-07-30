@@ -1,42 +1,132 @@
 # Spine
 
-This document is a compact implementation guide for agents building applications with Spine.
+> Agent-oriented guide to understanding Spine and building correct applications with the current checkout. Spine is a Go backend framework whose method signatures are the request/response contract and whose startup wiring is explicit.
 
-Use the current Spine source code and tests as the only API authority. In particular:
+## Read this first
 
-- Register every controller, service, repository, and DI-resolved interceptor with `app.Constructor`.
-- Register HTTP routes with method expressions such as `(*UserController).Get`.
-- Return `httpx.Response[T]` for successful HTTP responses and `httperr.*` errors for expected HTTP failures.
-- Check errors from `WebSocket().Register`, `Consumers().Register`, and `Run`.
-- Enable HTTP explicitly with `HTTP: &boot.HTTPOptions{}`. Without it, the current runtime does not start an HTTP server.
-- Use `App.Validate(options)` in deployment checks. It reports all network-free configuration problems as `*boot.ConfigError`; `Run` performs the same preflight before opening listeners or connecting to brokers.
-- Treat Kafka and RabbitMQ delivery as at least once: make consumers idempotent, and use an outbox when a database commit and an external publish must behave as one durable operation.
-- Keep broker transports secure by default. Kafka requires TLS unless a custom transport is supplied, and RabbitMQ requires `amqps://`; insecure compatibility flags are for isolated local development only.
-- Scope global interceptors with `InterceptorFor(boot.InterceptorHTTP|boot.InterceptorWebSocket|boot.InterceptorAll, ...)` when a policy does not apply to both HTTP and WebSocket traffic.
-- Implement all four `core.Interceptor` methods: `PreHandle`, `PostHandle`, `BeforeResponse`, and `AfterCompletion`. `BeforeResponse` is required even when an interceptor has no pre-response work.
-- Reusing the same interceptor pointer across scopes merges those scopes and executes that instance once; distinct instances of the same type execute independently.
+This guide was verified against checkout `d05b629`, the untagged `v0.5.2` development snapshot on `main`. It requires Go `1.25.5` or later. The latest tag in this checkout is `v0.5.1`; do not mistake the runtime banner for a released `v0.5.2` tag.
 
-The examples require Go `1.25.5` or later and the module:
+Use sources in this order:
+
+1. The current checkout's public API and tests are authoritative.
+2. Local executable examples and migration/security documents explain intended behavior.
+3. The three external demo repositories show complete application architecture.
+4. README prose and generated Swagger files are supporting material; when they disagree with code, follow code.
+
+The external demos reviewed on 2026-07-30 all pin Spine `v0.5.1`. Their architecture is useful, but reconcile copied code with this checkout before using it. The public usage style remains compatible with `v0.5.2`; the newer checkout rejects malformed requests and invalid registrations earlier.
+
+Do not import `github.com/NARUBROWN/spine/internal/...` from an application. Application code should use the root package, `core`, `interceptor/...`, and `pkg/...` only.
+
+For an external module, pin the intended version or commit explicitly. To match this guide's current source snapshot, use:
 
 ```sh
-go get github.com/NARUBROWN/spine
+go get github.com/NARUBROWN/spine@d05b629
 ```
 
-## 1. Minimal HTTP application
+The linked demos intentionally pin the released `v0.5.1`; keep their pin when reproducing them exactly, and do not use a `v0.5.2`-only API without upgrading their module first.
 
-Create a `main.go` file:
+## Choose the right reference first
+
+| Goal | Reference | Start with |
+|---|---|---|
+| Learn the current minimal runtime and secure defaults | This repository | `cmd/demo`, `examples/security-config`, `test/app_integration_test.go` |
+| CRUD, Bun ORM, request transactions, and Swagger UI | [spine-user-demo](https://github.com/NARUBROWN/spine-user-demo/tree/b07d2bb35d6e0b499c6f6974e1d34f3a4fafffba) | `main.go`, `routes/user_routes.go`, `interceptor/tx_interceptor.go`, `repository/user_repository.go` |
+| Kafka request/event flow, idempotency, poison messages, and outbox boundaries | [spine-simple-msa-demo](https://github.com/NARUBROWN/spine-simple-msa-demo/tree/aa3f0fae8057ec0999fadaafc9295b7c7987afbb) | `order-app/main.go`, `stock-app/main.go`, `shared/events`, `scenarios/outbox` |
+| Authenticated WebSocket chat, rooms, and runtime limits | [spine-simple-chat-demo](https://github.com/NARUBROWN/spine-simple-chat-demo/tree/b1fe598329eb79828eb4c84903c7fa3847d35914) | `main.go`, `interceptor/auth_interceptor.go`, `controller/chat_controller.go`, `e2e/websocket_e2e_test.go` |
+
+`Bun ORM` means the Go ORM at `github.com/uptrace/bun`; it does not mean the Bun JavaScript runtime.
+
+## Repository map
+
+Use this map instead of searching the entire repository blindly:
+
+- `app.go`: public `spine.App` assembly API.
+- `pkg/boot`: HTTP, WebSocket, Kafka, RabbitMQ, lifecycle, and validation options.
+- `pkg/path`, `pkg/query`, `pkg/header`, `pkg/multipart`: supported HTTP handler inputs.
+- `pkg/httpx`, `pkg/httperr`: supported HTTP outputs and expected HTTP errors.
+- `pkg/ws`: WebSocket connection identity and sending.
+- `pkg/event/publish`: domain-event contract and request-scoped publishing.
+- `pkg/route`: route-level interceptor options.
+- `core/interceptor.go`, `core/context.go`: interceptor and context contracts.
+- `interceptor/cors`: built-in CORS interceptor.
+- `cmd/demo`: a local application covering HTTP, files, events, WebSocket, CORS, and secure configuration.
+- `examples/security-config`: compact secure configuration example.
+- `test`: end-to-end HTTP and WebSocket usage.
+- `docs/migration`: version-specific behavioral changes.
+- `docs/security-configuration.md`: production security expectations.
+
+## Mental model
+
+Application assembly is explicit:
+
+```text
+constructors + routes + interceptors + transport registrations
+                         |
+                         v
+                  App.Validate(options)
+                         |
+                         v
+        Run / RunContext repeats static preflight
+                         |
+                         v
+       DI warm-up + registered read-consumer readiness
+                         |
+                         v
+         consumers/custom transports, then HTTP listener
+```
+
+A successful HTTP request follows this framework-controlled order:
+
+```text
+global PreHandle
+  -> route selection
+  -> route PreHandle
+  -> argument resolution
+  -> controller method
+  -> response preparation and validation
+  -> queued domain-event dispatch
+  -> PostHandle in reverse order
+  -> BeforeResponse in reverse order
+  -> transport write
+  -> AfterCompletion in reverse order
+```
+
+On an error, event dispatch and `PostHandle` are skipped; `BeforeResponse`, error rendering, transport write, and `AfterCompletion` finish the failure path. Global `PreHandle` runs before route selection, so its `HandlerMeta` may be empty. Route `PreHandle` runs before body, multipart, and path argument resolution. Put authentication and early rejection there; do not make an interceptor depend on already-resolved controller arguments.
+
+## Non-negotiable rules
+
+- Register every DI-created controller, consumer, repository, service, and interceptor constructor with `app.Constructor`.
+- A constructor is a function that returns exactly one value. It cannot return `(T, error)`, and neither the constructor nor its returned pointer may be nil.
+- Register handlers as pointer method expressions such as `(*UserController).Get`, never as bound methods such as `controller.Get`.
+- Check errors from `WebSocket().Register`, `Consumers().Register`, `Validate`, `Run`, and `RunContext`.
+- Enable HTTP explicitly with `HTTP: &boot.HTTPOptions{}`. `HTTP: nil` means no HTTP server.
+- Return `httpx.Response[T]`, `httpx.Binary`, or `httpx.Redirect` for successful HTTP responses. Do not return a raw DTO or raw string.
+- Use `httperr.*` or `*httperr.HTTPError` for expected HTTP failures. Generic errors become a non-leaking HTTP 500.
+- Use Spine semantic input types. Do not replace `path.Int`, `path.String`, or `path.Boolean` with primitive handler arguments.
+- Keep Kafka/RabbitMQ consumers idempotent. Delivery is at least once, not exactly once.
+- Use an outbox when a database write and external event publication must form one durable business operation.
+- Never enable plaintext broker compatibility in production.
+
+## Minimal HTTP application
 
 ```go
 package main
 
 import (
 	"log"
+	"time"
 
 	"github.com/NARUBROWN/spine"
 	"github.com/NARUBROWN/spine/pkg/boot"
+	"github.com/NARUBROWN/spine/pkg/httperr"
 	"github.com/NARUBROWN/spine/pkg/httpx"
 	"github.com/NARUBROWN/spine/pkg/path"
 )
+
+type Health struct {
+	ID     int64  `json:"id"`
+	Status string `json:"status"`
+}
 
 type HealthController struct{}
 
@@ -44,25 +134,25 @@ func NewHealthController() *HealthController {
 	return &HealthController{}
 }
 
-func (c *HealthController) Get(id path.Int) httpx.Response[map[string]any] {
-	return httpx.Response[map[string]any]{
-		Body: map[string]any{
-			"id":      id.Value,
-			"status":  "ok",
-			"service": "spine",
-		},
+func (c *HealthController) Get(id path.Int) (httpx.Response[Health], error) {
+	if id.Value <= 0 {
+		return httpx.Response[Health]{}, httperr.BadRequest("id must be positive")
 	}
+	return httpx.Response[Health]{
+		Body: Health{ID: id.Value, Status: "ok"},
+	}, nil
 }
 
 func main() {
 	app := spine.New()
-
 	app.Constructor(NewHealthController)
 	app.Route("GET", "/health/:id", (*HealthController).Get)
 
 	opts := boot.Options{
-		Address: ":8080",
-		HTTP:    &boot.HTTPOptions{},
+		Address:                ":8080",
+		EnableGracefulShutdown: true,
+		ShutdownTimeout:        10 * time.Second,
+		HTTP:                   &boot.HTTPOptions{},
 	}
 	if err := app.Validate(opts); err != nil {
 		log.Fatal(err)
@@ -73,449 +163,418 @@ func main() {
 }
 ```
 
-Run and verify it:
+Run it and call it:
 
 ```sh
 go run .
-curl http://localhost:8080/health/42
+curl -i http://localhost:8080/health/42
 ```
 
-The `path.Int` parameter is resolved from `:id`; access the parsed value through `id.Value`. Calling `Validate` separately is useful in CI and deployment checks; it does not open a network connection. `Run` repeats that validation and does not open the HTTP listener until dependency warm-up and enabled broker readiness checks succeed. When validation returns `*boot.ConfigError`, inspect `Issues`; treat each issue's `Code` as the stable machine-readable value instead of parsing the human-readable error message.
+Use `RunContext(ctx, opts)` instead of `Run(opts)` when a test or service host owns cancellation. `Run` and `RunContext` perform the same static validation as `Validate`; calling `Validate` separately is still useful in CI and deployment preflight.
 
-## 2. CRUD + DI + error handling
-
-This small in-memory API demonstrates the intended dependency direction:
-
-```text
-UserController -> UserService -> UserRepository
-```
-
-Place the following in `main.go`:
+When validation returns `*boot.ConfigError`, inspect `Issues` and use each issue's `Code` as the stable machine-readable value. Do not parse the human-readable message.
 
 ```go
-package main
+var configErr *boot.ConfigError
+if errors.As(err, &configErr) {
+	for _, issue := range configErr.Issues {
+		log.Printf("%s [%s]: %s", issue.Path, issue.Code, issue.Message)
+	}
+}
+```
 
-import (
-	"context"
-	"log"
-	"sync"
+`Validate` checks supported static options and registrations without network access. DI construction and broker readiness occur later in `Run`/`RunContext`, before the HTTP listener is opened.
 
-	"github.com/NARUBROWN/spine"
-	"github.com/NARUBROWN/spine/pkg/boot"
-	"github.com/NARUBROWN/spine/pkg/httperr"
-	"github.com/NARUBROWN/spine/pkg/httpx"
-	"github.com/NARUBROWN/spine/pkg/path"
+## Dependency injection
+
+Dependencies are constructor parameters. For example, `NewUserController(service *UserService)` depends on `NewUserService(repo UserRepository)`, which depends on a single registered concrete repository implementing that interface. Register the whole chain with `app.Constructor(NewBunDB, NewUserRepository, NewUserService, NewUserController)`. Providers are lazy singletons and controllers/consumers are warmed up before traffic starts.
+
+DI details agents commonly miss:
+
+- A concrete provider can satisfy one implemented interface automatically.
+- Resolving that provider through its concrete type and interface returns the same singleton.
+- If multiple registered concrete providers implement the same requested interface, resolution fails as ambiguous.
+- Circular dependencies fail with an explicit dependency path.
+- A constructor panic is converted to a startup error.
+- Direct interceptor instances do not need constructor registration. DI-resolved interceptors do.
+- A typed nil interceptor such as `(*TxInterceptor)(nil)` is a type token asking the container for that type. Register its constructor first.
+
+Example:
+
+```go
+app.Constructor(NewTxInterceptor)
+app.InterceptorFor(
+	boot.InterceptorHTTP,
+	(*TxInterceptor)(nil),
 )
-
-type User struct {
-	ID   int64  `json:"id"`
-	Name string `json:"name"`
-}
-
-type CreateUserRequest struct {
-	Name string `json:"name"`
-}
-
-type UserRepository struct {
-	mu     sync.RWMutex
-	nextID int64
-	users  map[int64]User
-}
-
-func NewUserRepository() *UserRepository {
-	return &UserRepository{nextID: 1, users: make(map[int64]User)}
-}
-
-func (r *UserRepository) Create(user User) User {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	user.ID = r.nextID
-	r.nextID++
-	r.users[user.ID] = user
-	return user
-}
-
-func (r *UserRepository) FindByID(id int64) (User, bool) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	user, ok := r.users[id]
-	return user, ok
-}
-
-type UserService struct {
-	repo *UserRepository
-}
-
-func NewUserService(repo *UserRepository) *UserService {
-	return &UserService{repo: repo}
-}
-
-func (s *UserService) Create(name string) User {
-	return s.repo.Create(User{Name: name})
-}
-
-func (s *UserService) Get(id int64) (User, bool) {
-	return s.repo.FindByID(id)
-}
-
-type UserController struct {
-	service *UserService
-}
-
-func NewUserController(service *UserService) *UserController {
-	return &UserController{service: service}
-}
-
-func (c *UserController) Create(
-	ctx context.Context,
-	req *CreateUserRequest,
-) (httpx.Response[User], error) {
-	if req == nil || req.Name == "" {
-		return httpx.Response[User]{}, httperr.BadRequest("name is required")
-	}
-
-	return httpx.Response[User]{
-		Body: c.service.Create(req.Name),
-		Options: httpx.ResponseOptions{Status: 201},
-	}, nil
-}
-
-func (c *UserController) Get(id path.Int) (httpx.Response[User], error) {
-	user, ok := c.service.Get(id.Value)
-	if !ok {
-		return httpx.Response[User]{}, httperr.NotFound("user not found")
-	}
-	return httpx.Response[User]{Body: user}, nil
-}
-
-func main() {
-	app := spine.New()
-
-	app.Constructor(
-		NewUserRepository,
-		NewUserService,
-		NewUserController,
-	)
-
-	app.Route("POST", "/users", (*UserController).Create)
-	app.Route("GET", "/users/:id", (*UserController).Get)
-
-	if err := app.Run(boot.Options{
-		Address: ":8080",
-		HTTP:    &boot.HTTPOptions{},
-	}); err != nil {
-		log.Fatal(err)
-	}
-}
 ```
 
-Verify the contract:
+## HTTP routing and method signatures
 
-```sh
-go run .
-curl -i -X POST http://localhost:8080/users \
-  -H 'Content-Type: application/json' \
-  -d '{"name":"Ada"}'
-curl -i http://localhost:8080/users/1
-curl -i http://localhost:8080/users/999
-```
-
-Expected failure responses are returned through `httperr.BadRequest` and `httperr.NotFound`; Spine serializes them as JSON with a `message` field.
-
-DI constructors and their returned providers must be non-nil. A provider resolved through its concrete type and through an implemented interface shares one singleton. A successful HTTP response is serialized and its cookies and status are validated before `BeforeResponse` runs, so a transaction interceptor can roll back on response-preparation failures. A physical socket write still cannot be atomic with a database commit.
-
-HTTP timeouts, header size, and body size have bounded defaults when their option is zero. Set `HTTPOptions.MaxBodyBytes` to a negative value only when deliberately disabling the request-body limit. For browser APIs, prefer `cors.NewValidated`; credentials cannot be combined with the wildcard origin `*`. Spine rejects invalid response cookies before committing the response, so encode arbitrary Unicode or delimiter-containing cookie values with `httpx.EncodeCookieValue` and decode them with `httpx.DecodeCookieValue`.
-
-## 3. WebSocket chat
-
-This application receives a JSON message on `/ws/chat` and broadcasts it to every connected client. Create `main.go`:
+Register a route with:
 
 ```go
-package main
+app.Route("GET", "/users/:user_id", (*UserController).Get)
+```
 
-import (
-	"context"
-	"encoding/json"
-	"log"
-	"strings"
-	"sync"
-	"time"
+HTTP methods are trimmed and uppercased. Route paths use `:name` parameters. Path semantic arguments consume path parameters from left to right, not by Go parameter name:
 
-	"github.com/NARUBROWN/spine"
-	"github.com/NARUBROWN/spine/pkg/boot"
-	"github.com/NARUBROWN/spine/pkg/ws"
+```go
+app.Route("GET", "/orgs/:org_id/users/:user_id", (*UserController).Get)
+
+func (c *UserController) Get(orgID path.Int, userID path.Int) httpx.Response[User] {
+	// orgID binds :org_id; userID binds :user_id.
+}
+```
+
+Static and parameter routes that overlap for the same method are rejected as ambiguous during boot. A global prefix must be static, start with `/`, and contain neither `:` nor `*`.
+
+```go
+HTTP: &boot.HTTPOptions{GlobalPrefix: "/api/v1"}
+```
+
+Use `route.WithInterceptors` for route-only policies:
+
+```go
+app.Route(
+	"POST",
+	"/admin/users",
+	(*AdminController).Create,
+	route.WithInterceptors(&AdminAuthInterceptor{}),
 )
-
-type ChatController struct {
-	mu      sync.RWMutex
-	clients map[string]ws.Sender
-}
-
-func NewChatController() *ChatController {
-	return &ChatController{clients: make(map[string]ws.Sender)}
-}
-
-type ChatMessage struct {
-	Message string `json:"message"`
-}
-
-type ChatEvent struct {
-	Type    string `json:"type"`
-	From    string `json:"from"`
-	Message string `json:"message"`
-	At      string `json:"at"`
-}
-
-func (c *ChatController) OnMessage(
-	ctx context.Context,
-	connID ws.ConnectionID,
-	msg ChatMessage,
-) error {
-	sender, ok := ctx.Value(ws.SenderKey).(ws.Sender)
-	if ok && sender != nil {
-		c.mu.Lock()
-		c.clients[connID.Value] = sender
-		c.mu.Unlock()
-	}
-
-	message := strings.TrimSpace(msg.Message)
-	if message == "" {
-		return nil
-	}
-
-	payload, err := json.Marshal(ChatEvent{
-		Type:    "message",
-		From:    connID.Value,
-		Message: message,
-		At:      time.Now().UTC().Format(time.RFC3339),
-	})
-	if err != nil {
-		return err
-	}
-
-	c.mu.RLock()
-	clients := make(map[string]ws.Sender, len(c.clients))
-	for id, client := range c.clients {
-		clients[id] = client
-	}
-	c.mu.RUnlock()
-
-	var firstErr error
-	for id, client := range clients {
-		if err := client.Send(ws.TextMessage, payload); err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
-			c.mu.Lock()
-			delete(c.clients, id)
-			c.mu.Unlock()
-		}
-	}
-	return firstErr
-}
-
-func main() {
-	app := spine.New()
-	app.Constructor(NewChatController)
-
-	if err := app.WebSocket().Register(
-		"/ws/chat",
-		(*ChatController).OnMessage,
-	); err != nil {
-		log.Fatal(err)
-	}
-
-	if err := app.Run(boot.Options{
-		Address: ":8080",
-		HTTP: &boot.HTTPOptions{
-			WebSocket: boot.WebSocketOptions{
-				AllowedOrigins: []string{"http://localhost:3000"},
-				MaxConnections: 256,
-			},
-		},
-	}); err != nil {
-		log.Fatal(err)
-	}
-}
 ```
 
-Run two WebSocket clients against `ws://localhost:8080/ws/chat`, then send:
+### Supported HTTP inputs
 
-```json
-{"message":"hello"}
-```
+| Handler parameter | Value supplied by Spine | Important rule |
+|---|---|---|
+| `context.Context` | Request context plus request-scoped event publisher | Use this with `publish.Event` and database calls. |
+| `path.Int` | Parsed `int64` from the next `:segment` | Read `.Value`; malformed input returns HTTP 400. |
+| `path.String` | Raw string from the next `:segment` | Read `.Value`. |
+| `path.Boolean` | Parsed boolean from the next `:segment` | Accepts true/false forms supported by Spine; malformed input returns HTTP 400. |
+| `query.Values` | All query values | `Int(key, default)` falls back on missing or invalid input; validate business ranges yourself. |
+| `query.Pagination` | `page` and `size` | Defaults to page 1 and size 20; validate non-positive or excessive values yourself. |
+| `header.Values` | HTTP headers | Use `Get` and `Has`. |
+| `*SomeDTO` with no `form` tags | Bound request DTO | HTTP DTOs must be pointers to structs; the Echo binder and request `Content-Type` select the body format. Malformed input returns HTTP 400. |
+| `*SomeForm` with at least one `form` tag | Bound form DTO | The presence of a form tag selects form binding. |
+| `multipart.UploadedFiles` | Uploaded file descriptors | Call each file's `Open` and close the returned stream. |
+| `pkg/spine.Ctx` or `core.ControllerContext` | Read-only view of values set by interceptors | Only `Get` is exposed; custom interfaces with extra methods are unsupported. |
 
-Each connected client receives a JSON `ChatEvent`. `ws.ConnectionID` identifies the sender, and `ws.Sender` is obtained from the request context using `ws.SenderKey`.
+Arbitrary primitive parameters and application service parameters are not controller arguments. Put services on the controller through constructor injection.
 
-An empty `AllowedOrigins` uses scheme-and-host same-origin checks; production browser clients should normally use exact origins. When `TrustedProxyCIDRs` is configured, the trusted reverse proxy must remove or overwrite client-supplied forwarding headers. The default active-and-pending connection limit is `boot.DefaultWebSocketMaxConnections` (1024); use a positive value or `boot.UnlimitedWebSocketConnections` explicitly. Capacity rejection returns HTTP 503 with `Retry-After` and the `WEBSOCKET_CAPACITY_EXCEEDED` code. Zero message-size and timeout options use bounded defaults.
+### Supported HTTP outputs
 
-For authentication before upgrade, use an interceptor that implements both `core.Interceptor` and the optional `core.WebSocketHandshakeInterceptor`, then register the same instance for WebSocket traffic:
+| Return value | Result |
+|---|---|
+| `httpx.Response[T]` or `*httpx.Response[T]` | JSON for non-string `T`; plain text for string `T`; default status 200. |
+| `httpx.Binary` or `*httpx.Binary` | Byte response with explicit content type; default status 200. |
+| `httpx.Redirect` or `*httpx.Redirect` | `Location` response; default status 302. |
+| `error` | Expected `httperr.HTTPError` or sanitized HTTP 500. |
+| `(supportedResponse, error)` | Response on nil error; error response otherwise. |
+
+`httpx.ResponseOptions` controls status, headers, and cookies:
 
 ```go
-auth := &AuthInterceptor{}
-app.InterceptorFor(boot.InterceptorWebSocket, auth)
+return httpx.Response[User]{
+	Body: user,
+	Options: httpx.ResponseOptions{
+		Status:  http.StatusCreated,
+		Headers: map[string]string{"Location": fmt.Sprintf("/users/%d", user.ID)},
+		Cookies: []httpx.Cookie{{
+			Name:     "session",
+			Value:    httpx.EncodeCookieValue(token),
+			Path:     "/",
+			HttpOnly: true,
+			Secure:   true,
+			SameSite: httpx.SameSiteLax,
+		}},
+	},
+}, nil
+```
 
-func (i *AuthInterceptor) PreHandshake(
-	ctx core.WebSocketHandshakeContext,
-	meta core.HandlerMeta,
-) error {
-	token := ctx.Header("Authorization")
-	if token == "" {
-		return httperr.Unauthorized("missing credentials")
-	}
-	return i.verify(token)
+Spine validates status, JSON serialization, and cookies before `BeforeResponse`. Invalid cookie names, values, `SameSite`, or `Priority` fail without partially committing a success response. Use `httpx.EncodeCookieValue`/`DecodeCookieValue` for arbitrary Unicode or delimiter-containing values.
+
+### HTTP errors
+
+Built-in helpers are:
+
+```go
+httperr.BadRequest("...")
+httperr.Unauthorized("...")
+httperr.NotFound("...")
+httperr.InternalServerError("...")
+```
+
+Use `*httperr.HTTPError` for another status:
+
+```go
+return httpx.Response[User]{}, &httperr.HTTPError{
+	Status:  http.StatusConflict,
+	Message: "email already exists",
+	Cause:   err,
 }
 ```
 
-The connection slot is reserved before `PreHandshake`, and `PreHandshake` runs before the HTTP upgrade; rejected handshakes release their slot. Message-level `PreHandle` keeps running once per message. Inside a message interceptor, type-assert its `core.ExecutionContext` to `core.WebSocketMessageContext` to read the immutable handshake headers, query values, cookies, remote address, host, and request URI. These request-view interfaces are not additional controller-handler parameters.
+Expected errors serialize as `{"message":"..."}`. Generic errors return status 500 and `{"message":"Internal server error"}`; their original text is not exposed to clients.
 
-## 4. Kafka event publishing and consumption
+## Interceptors
 
-Use two applications with a shared event type. The order application publishes `order.created`; the stock application consumes it.
-
-Assume the module path is `example.com/spine-kafka` and a plaintext development-only Kafka broker is available at `localhost:9092`. Spine requires TLS by default; the local examples below opt in to insecure transport explicitly. Production deployments should configure `KafkaOptions.TLS` instead.
-
-Create `shared/events/order_created.go`:
+Every `core.Interceptor` must implement all four methods:
 
 ```go
-package events
+type Interceptor interface {
+	PreHandle(ctx core.ExecutionContext, meta core.HandlerMeta) error
+	PostHandle(ctx core.ExecutionContext, meta core.HandlerMeta)
+	BeforeResponse(ctx core.ExecutionContext, meta core.HandlerMeta, executionErr error) error
+	AfterCompletion(ctx core.ExecutionContext, meta core.HandlerMeta, err error)
+}
+```
 
-import "time"
+- `app.Interceptor(x)` applies `x` to HTTP and WebSocket messages.
+- `app.InterceptorFor(boot.InterceptorHTTP, x)` applies only to HTTP.
+- `app.InterceptorFor(boot.InterceptorWebSocket, x)` applies only to WebSocket messages and handshake auth when implemented.
+- `boot.InterceptorAll` means HTTP plus WebSocket, not Kafka/RabbitMQ consumers.
+- `route.WithInterceptors` applies only to that HTTP route.
+- Reusing the same interceptor pointer across scopes merges its scopes and executes that instance once. Different instances of the same type execute independently.
 
+For CORS, prefer startup validation and scope it to HTTP:
+
+```go
+corsInterceptor, err := cors.NewValidated(cors.Config{
+	AllowOrigins:     []string{"https://app.example.com"},
+	AllowMethods:     []string{"GET", "POST", "OPTIONS"},
+	AllowHeaders:     []string{"Authorization", "Content-Type"},
+	AllowCredentials: true,
+})
+if err != nil {
+	log.Fatal(err)
+}
+app.InterceptorFor(boot.InterceptorHTTP, corsInterceptor)
+```
+
+Credentialed CORS cannot use wildcard origin `*`.
+
+### Request transaction pattern
+
+The Bun demo uses this safe boundary:
+
+1. `PreHandle` begins a transaction and stores `bun.Tx` in `ExecutionContext`.
+2. The controller reads it through `pkg/spine.Ctx.Get("tx")` and passes it as `bun.IDB` to the service/repository.
+3. `BeforeResponse` rolls back when `executionErr != nil`; otherwise it commits.
+
+Response serialization, cookie validation, event dispatch, and post-processing happen before `BeforeResponse`, so their framework-controlled failures can trigger rollback. This also means a broker event can be published before the transaction commit, and a later commit failure cannot recall it. A database commit is atomic with neither broker publication nor the physical socket write. Use an outbox for database-plus-broker atomicity.
+
+## Swagger and transport extensions
+
+Spine does not generate OpenAPI automatically. The Bun demo uses Swaggo annotations and generated `docs/docs.go`, `docs/swagger.json`, and `docs/swagger.yaml`, imports that generated package for registration, then uses `app.Transport` to type-assert `*echo.Echo` and mount `httpSwagger.WrapHandler` at `/swagger/*`. Keep annotations and generated `docs/*` in sync. See the demo's `main.go` for the copy-safe imports and hook; generated Swagger is supporting output, not the authority for route behavior.
+
+Use `App.RegisterTransport` only for an independent custom transport implementing `core.CustomTransport` (`Init`, `Start`, and `Stop`).
+
+## WebSocket
+
+Register WebSocket handlers with method expressions and check the registration error:
+
+```go
+app.Constructor(NewChatController)
+if err := app.WebSocket().Register(
+	"/ws/chat",
+	(*ChatController).OnMessage,
+); err != nil {
+	log.Fatal(err)
+}
+```
+
+Supported WebSocket handler inputs are:
+
+- `context.Context`
+- `ws.ConnectionID`
+- raw `[]byte`
+- a non-pointer struct decoded from the JSON message
+
+Prefer `func (c *ChatController) OnMessage(ctx context.Context, id ws.ConnectionID, command ChatCommand) error`. Use `ws.Send(ctx, ws.TextMessage, encoded)` for the current connection. A non-nil handler error closes with WebSocket code 1011; to keep the socket open for invalid application input, send a typed error event and return nil.
+
+`ws.Send` sends only to the current connection. For broadcast or rooms, obtain `ws.Sender` from `ctx.Value(ws.SenderKey)`, store senders in shared controller state, copy recipients while locked, then send after releasing the lock.
+
+Spine currently has no application-level connect/disconnect callback. A sender kept by application state may only be noticed as stale on a later failed send. Do not treat an in-memory sender map as durable presence; use an external presence store with expiry for multi-instance or strict presence semantics.
+
+### WebSocket handshake authentication
+
+Authentication before upgrade belongs in one interceptor instance that implements the four `core.Interceptor` methods plus `core.WebSocketHandshakeInterceptor.PreHandshake`. Register that instance with `app.InterceptorFor(boot.InterceptorWebSocket, auth)`. In `PreHandshake`, read headers/query/cookies from `core.WebSocketHandshakeContext` and return a 4xx `httperr` on rejection. Copy the complete constant-time token implementation from the chat demo's [`interceptor/auth_interceptor.go`](https://github.com/NARUBROWN/spine-simple-chat-demo/blob/b1fe598329eb79828eb4c84903c7fa3847d35914/interceptor/auth_interceptor.go), not a partial interface implementation.
+
+A connection slot is reserved before `PreHandshake`; rejected handshakes release it. `PreHandshake` runs before HTTP upgrade. Message-level `PreHandle` still runs for every accepted message.
+
+Inside a message interceptor, type-assert `core.ExecutionContext` to `core.WebSocketMessageContext` to inspect the immutable handshake headers, query values, cookies, remote address, host, and request URI. These request-view interfaces are not controller handler parameters.
+
+### WebSocket runtime options
+
+WebSocket requires non-nil `HTTP`. Configure `HTTP.WebSocket` fields such as `AllowedOrigins`, `TrustedProxyCIDRs`, `MaxConnections`, `MaxMessageBytes`, `HandshakeTimeout`, `ReadTimeout`, `WriteTimeout`, and `PingInterval`.
+
+- Empty `AllowedOrigins` performs scheme-and-host same-origin checks when an `Origin` header is present; non-browser clients without `Origin` are allowed.
+- Exact production origins are preferred. `*` allows every origin.
+- Trusted proxies must remove or overwrite client-supplied forwarding headers.
+- Zero limits/timeouts select bounded framework defaults.
+- Default active-plus-pending connection capacity is `boot.DefaultWebSocketMaxConnections` (1024).
+- Use a positive limit or explicit `boot.UnlimitedWebSocketConnections`.
+- Capacity rejection is HTTP 503 with `Retry-After` and code `WEBSOCKET_CAPACITY_EXCEEDED`.
+- Oversized messages close with WebSocket code 1009.
+
+## Domain events and Kafka
+
+An event must implement:
+
+```go
+type DomainEvent interface {
+	Name() string
+	OccurredAt() time.Time
+}
+```
+
+Example event:
+
+```go
 type OrderCreated struct {
+	EventID string    `json:"event_id"`
 	OrderID int64     `json:"order_id"`
 	At      time.Time `json:"at"`
 }
 
-func (e OrderCreated) Name() string {
-	return "order.created"
-}
-
-func (e OrderCreated) OccurredAt() time.Time {
-	return e.At
-}
+func (e OrderCreated) Name() string         { return "order.created" }
+func (e OrderCreated) OccurredAt() time.Time { return e.At }
 ```
 
-Create `order-app/main.go`:
+Queue it from an HTTP, WebSocket, or consumer handler's `context.Context`:
 
 ```go
-package main
-
-import (
-	"context"
-	"log"
-	"time"
-
-	"example.com/spine-kafka/shared/events"
-	"github.com/NARUBROWN/spine"
-	"github.com/NARUBROWN/spine/pkg/boot"
-	"github.com/NARUBROWN/spine/pkg/event/publish"
-	"github.com/NARUBROWN/spine/pkg/httpx"
-	"github.com/NARUBROWN/spine/pkg/path"
-)
-
-type OrderController struct{}
-
-func NewOrderController() *OrderController {
-	return &OrderController{}
-}
-
-func (c *OrderController) Create(
-	ctx context.Context,
-	orderID path.Int,
-) httpx.Response[string] {
-	publish.Event(ctx, events.OrderCreated{
-		OrderID: orderID.Value,
-		At:      time.Now(),
-	})
-
-	return httpx.Response[string]{
-		Body:    "accepted",
-		Options: httpx.ResponseOptions{Status: 202},
-	}
-}
-
-func main() {
-	app := spine.New()
-	app.Constructor(NewOrderController)
-	app.Route("POST", "/orders/:id", (*OrderController).Create)
-
-	if err := app.Run(boot.Options{
-		Address: ":8080",
-		Kafka: &boot.KafkaOptions{
-			Brokers: []string{"localhost:9092"},
-			AllowInsecureTransport: true, // isolated local development only
-			Write:   &boot.KafkaWriteOptions{},
-		},
-		HTTP: &boot.HTTPOptions{},
-	}); err != nil {
-		log.Fatal(err)
-	}
-}
+publish.Event(ctx, OrderCreated{
+	EventID: eventID,
+	OrderID: orderID.Value,
+	At:      time.Now().UTC(),
+})
 ```
 
-Create `stock-app/main.go`:
+`publish.Event` adds the event to the current execution context. Spine dispatches queued events only after the handler succeeds and, for HTTP, after response preparation succeeds. The function returns no error. If no writer is configured, the handler can still succeed while nothing is delivered externally, so every publishing process must enable `Kafka.Write` or `RabbitMQ.Write` deliberately.
+
+Use a consumer signature such as `func (c *OrderConsumer) OnCreated(ctx context.Context, eventName string, event OrderCreated) error`. Register `NewOrderConsumer` with `app.Constructor`, then check the error from `app.Consumers().Register("order.created", (*OrderConsumer).OnCreated)`. Consumer inputs are `context.Context`, event name `string`, raw `[]byte`, and a non-pointer struct decoded from JSON. A topic can have only one registered handler; make it idempotent by stable event ID.
+
+### Kafka configuration
+
+Producer and consumer in one process:
 
 ```go
-package main
-
-import (
-	"context"
-	"log"
-
-	"example.com/spine-kafka/shared/events"
-	"github.com/NARUBROWN/spine"
-	"github.com/NARUBROWN/spine/pkg/boot"
-)
-
-type OrderConsumer struct{}
-
-func NewOrderConsumer() *OrderConsumer {
-	return &OrderConsumer{}
-}
-
-func (c *OrderConsumer) OnCreated(
-	ctx context.Context,
-	eventName string,
-	event events.OrderCreated,
-) error {
-	log.Printf("received %s for order %d", eventName, event.OrderID)
-	return nil
-}
-
-func main() {
-	app := spine.New()
-	app.Constructor(NewOrderConsumer)
-
-	if err := app.Consumers().Register(
-		"order.created",
-		(*OrderConsumer).OnCreated,
-	); err != nil {
-		log.Fatal(err)
-	}
-
-	if err := app.Run(boot.Options{
-		Kafka: &boot.KafkaOptions{
-			Brokers: []string{"localhost:9092"},
-			AllowInsecureTransport: true, // isolated local development only
-			Read: &boot.KafkaReadOptions{
-				GroupID: "stock-service",
-			},
-		},
-	}); err != nil {
-		log.Fatal(err)
-	}
+Kafka: &boot.KafkaOptions{
+	Brokers: []string{"kafka.example.com:9093"},
+	Read: &boot.KafkaReadOptions{
+		GroupID: "order-service",
+	},
+	Write: &boot.KafkaWriteOptions{
+		TopicPrefix: "prod.",
+	},
 }
 ```
 
-Start `stock-app` before `order-app`, then call:
+Spine creates TLS 1.2+ transport by default. `TLS` is shared, `Dialer` configures consumer/read transport, and `Transport` configures publisher/write transport. A process that both reads and writes must secure both directions when using custom SASL/TLS. Use this only for an isolated plaintext development broker:
+
+```go
+AllowInsecureTransport: true
+```
+
+`KafkaWriteOptions.TopicPrefix` is simple string concatenation and adds no separator. If a producer uses `demo.`, register the consumer topic as `demo.order.created` yourself.
+
+Kafka behavior:
+
+- Framework-managed writes require acknowledgements from all in-sync replicas.
+- Consumption is at least once; use a stable event ID and durable deduplication.
+- A handler error causes NACK/reconstruction behavior and can redeliver the event.
+- `ConsumerRetry` controls transport/reader reconstruction, not an application handler retry budget.
+- A permanently failing poison record can block the partition. Spine does not automatically skip it or choose a retry topic/DLQ.
+- A consumer-only process may leave `HTTP` nil and still handles `SIGINT`/`SIGTERM`.
+- Shutdown waits for active handlers, ACK/NACK work, and readers to drain.
+
+### Transactional outbox boundary
+
+`publish.Event` is request-scoped publication, not a database transaction. For durable database-plus-event behavior:
+
+1. Write the business row and outbox row in one database transaction.
+2. Give the event a stable unique ID.
+3. A separate relay publishes pending rows with broker acknowledgements.
+4. Mark the row published after acknowledgement.
+5. Accept that a crash between publish and marking can duplicate delivery.
+6. Deduplicate in every downstream consumer.
+
+The MSA demo's `scenarios/outbox` illustrates the boundary with a JSON-file store and direct `kafka-go`; it is educational, not a production multi-process database outbox.
+
+## RabbitMQ variant
+
+The same `publish.Event` and `Consumers().Register` APIs use RabbitMQ when `boot.Options.RabbitMQ` configures `RabbitMqReadOptions` and/or `RabbitMqWriteOptions` with a named exchange.
+
+- `amqps://` is required by default; `amqp://` needs local-only `AllowInsecureTransport: true`.
+- Default prefetch is 1.
+- Default handler failure policy rejects without requeue.
+- Provision the dead-letter exchange before referencing it.
+- Publisher confirms and retries are still at least once; consumers must remain idempotent.
+- If Kafka and RabbitMQ writers are both enabled, a queued event is dispatched to both.
+
+## Runtime and security defaults
+
+Zero values select bounded defaults for HTTP timeouts, header size, request body size, WebSocket size/timeouts/capacity, and shutdown timeout. Broker retry delays are bounded by default, but Kafka/RabbitMQ consumer `MaxAttempts: 0` means unlimited transport retries; RabbitMQ publisher zero values use a bounded three-attempt default.
+
+Important exceptions and rules:
+
+- `HTTPOptions.MaxBodyBytes < 0` explicitly disables the request-body limit.
+- Invalid JSON/form/multipart and invalid `path.Int`/`path.Boolean` produce HTTP 400.
+- Request bodies above the configured maximum produce HTTP 413.
+- `DisableRecover: false` (the zero value) keeps recovery enabled.
+- Use `EnableGracefulShutdown: true` for signal-driven HTTP shutdown.
+- Zero `ShutdownTimeout` uses the 10-second framework default; set a deliberate positive value when the application's HTTP/custom-transport drain budget differs.
+- `ShutdownTimeout` does not forcibly cap consumer handler/ACK/NACK drain; consumer `Stop` waits for that runtime to finish.
+- Do not log broker URLs with embedded credentials or secret tokens.
+- Do not trust forwarded headers unless the immediate peer matches an exact configured proxy CIDR.
+
+Read `docs/security-configuration.md` and the latest applicable migration guide before changing production defaults.
+
+## External example details
+
+### Bun ORM + Swagger: spine-user-demo
+
+Reviewed snapshot: [`b07d2bb`](https://github.com/NARUBROWN/spine-user-demo/tree/b07d2bb35d6e0b499c6f6974e1d34f3a4fafffba), Go `1.25.5`, Spine `v0.5.1`.
+
+Follow `HTTP -> controller -> service -> repository -> Bun -> MySQL`. Together, `main.go`, `routes/user_routes.go`, `interceptor/tx_interceptor.go`, `repository/user_repository.go`, and the transaction E2E show DI, `bun.IDB` reuse across `*bun.DB`/`bun.Tx`, response-aware rollback, error mapping, and Swaggo UI. Set `SPINE_DEMO_MYSQL_DSN`, run `go run . -migrate` before the first `go run .`, and open `/swagger/index.html`. Actual CRUD uses `/users?id=1`, not `/users/:id`, with no list endpoint; prefer code over mismatching README/generated fields.
+
+### Kafka MSA: spine-simple-msa-demo
+
+Reviewed snapshot: [`aa3f0fa`](https://github.com/NARUBROWN/spine-simple-msa-demo/tree/aa3f0fae8057ec0999fadaafc9295b7c7987afbb), Go `1.25.5`, Spine `v0.5.1`.
+
+The repository name ends in `-demo`, but its `go.mod` module/import path is `github.com/NARUBROWN/spine-simple-msa`. Do not rewrite imports to add `-demo`.
+
+The flow is `POST order -> order.created -> stock idempotency decision -> stock.reserved|stock.rejected -> order result consumer -> GET status`. Read both app `main.go` files, `shared/events`, and `scenarios/outbox`; run the stock worker then order HTTP service. Docker E2E uses Redpanda port `19092`, while manual defaults use Kafka `9092`. Topic prefix must include its separator and match both processes. JSON/in-memory stores are educational; production provisioning, keys, retention, schemas, retry topics, and DLQ remain application work.
+
+### WebSocket chat: spine-simple-chat-demo
+
+Reviewed snapshot: [`b1fe598`](https://github.com/NARUBROWN/spine-simple-chat-demo/tree/b1fe598329eb79828eb4c84903c7fa3847d35914), Go `1.25.5`, Spine `v0.5.1`.
+
+This single-process in-memory server implements authenticated `join -> message -> leave`, one room per connection, room broadcast, typed errors, and runtime limit tests. Read its main, auth interceptor, controller, and E2E. Query `token` or exact `Authorization: Bearer ...` authenticates the handshake; the header wins, and blank config falls back to public `demo-token`, so production must override it and use `wss://`. There is no frontend, persistence, multi-instance state, or user/room authorization. Disconnect cleanup waits for a failed send; 1000-rune logical messages can exceed the 4096-byte frame limit; `leave` keeps the socket open. Build-tagged E2E requires a running server and `go test -tags=e2e -v ./e2e`.
+
+## Agent implementation checklist
+
+- Identify required transports, then read the closest example's actual `main.go`, handler, test, and `go.mod`.
+- Define DTO/signature contracts, DI direction, idempotency key, transaction/outbox boundary, retry/DLQ policy, and shutdown behavior before wiring routes.
+- Centralize assembly; use semantic inputs, supported outputs, narrow interceptor scopes, and environment-backed secrets.
+- Check every registration/startup error; enable `HTTP` only where a listener is intended.
+- Verify WebSocket origins/auth/capacity, secure broker transport, poison-message behavior, and durable consumer deduplication.
+- Remember that `Validate` does not replace DI warm-up, route-ambiguity checks, or live consumer readiness in `Run`.
+
+For Go changes, run:
 
 ```sh
-curl -i -X POST http://localhost:8080/orders/123
+gofmt -w <changed-go-files>
+go test ./...
+go test -race ./...
+go vet ./...
 ```
 
-`publish.Event` queues events on the request context. Spine dispatches them only after the controller succeeds and the HTTP response passes serialization, cookie, and status validation, using the configured Kafka publisher. The consumer handler receives `context.Context`, the event name, and the DTO decoded from the Kafka message.
+Run relevant broker/database/WebSocket E2E separately. Translate POSIX environment syntax for PowerShell:
 
-Framework-managed Kafka writes require acknowledgements from all in-sync replicas. Consumption is still at least once: handlers must be idempotent, and a permanently failing record can block its partition because Spine does not automatically skip it or choose a dead-letter policy. Reader creation and reconstruction after failed ACK/NACK use `KafkaOptions.ConsumerRetry`; shutdown waits for active handlers, ACK/NACK work, and readers to drain.
-
-Configure `KafkaOptions.Write` in every application that calls `publish.Event`; without an enabled publisher, queued domain events have no external destination. A consumer-only application handles `SIGINT` and `SIGTERM` even without HTTP. For an HTTP application, enable `EnableGracefulShutdown` and set a positive `ShutdownTimeout` when signal-driven graceful shutdown is required.
+```powershell
+$env:SPINE_DEMO_KAFKA_BROKER = "localhost:19092"
+go run ./stock-app
+```
