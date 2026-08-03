@@ -1,5 +1,5 @@
 <p align="center">
-  <a href="README.md">한국어</a> | English
+  <a href="README.md">한국어</a> | English | <a href="README.ja.md">日本語</a> | <a href="README.zh-Hans.md">简体中文</a> | <a href="README.zh-Hant.md">繁體中文</a>
 </p>
 
 # 🦴 Spine
@@ -19,14 +19,47 @@ It does not hide how a request is resolved and executed.
 ## Links
 
 - Official site: https://spine.na2ru2.me/en/
-- [v0.5 secure-default migration](docs/migration/v0.5.en.md)
-- [v0.5.1 corrective migration](docs/migration/v0.5.1.en.md)
-- [v0.5.2 request-processing corrections](docs/migration/v0.5.2.en.md)
-- [Security configuration reference](docs/security-configuration.en.md)
-- [Runnable security configuration example](examples/security-config/main.go)
+- Spine CLI (project generation and execution-contract inspection): https://github.com/NARUBROWN/spine-cli
 - Bun ORM + Swagger integration example project: https://github.com/NARUBROWN/spine-user-demo
 - Kafka MSA example project: https://github.com/NARUBROWN/spine-simple-msa-demo
 - Simple WebSocket chat example project: https://github.com/NARUBROWN/spine-simple-chat-demo
+
+---
+
+## Spine CLI
+
+[Spine CLI](https://github.com/NARUBROWN/spine-cli) is a Go CLI that generates Spine projects and components
+and inspects HTTP, DI, interceptor, consumer, and WebSocket execution contracts from source code. It also
+supports contract snapshots and diffs, plus OpenAPI and AsyncAPI exports.
+
+Install the short `spine` command with Go 1.25.5 or later.
+
+```sh
+go install github.com/NARUBROWN/spine-cli/cmd/spine@v0.1.4
+spine version
+```
+
+Create a project or inspect the contract of an existing one.
+
+```sh
+spine new todo-api --module github.com/acme/todo-api
+spine context --root ./todo-api --json
+spine contract check --root ./todo-api --warnings-as-errors --json
+spine verify --root ./todo-api --warnings-as-errors --json
+```
+
+The generator does not overwrite existing files by default. Before applying a change, review the dry-run diff
+and `base_hash`, then pass that same hash to `--if-match`.
+
+```sh
+spine g resource order --root . --dry-run --json
+spine g resource order --root . --if-match <base_hash> --json
+```
+
+Spine CLI `v0.1.4` pins newly generated projects to Spine `v0.5.1`. When using it with another version or a
+development snapshot of this repository, check the generated `go.mod` and the contract results. See the
+[Spine CLI documentation](https://github.com/NARUBROWN/spine-cli#readme) for the complete command set and
+precise analysis boundaries.
 
 ---
 

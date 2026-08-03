@@ -11,7 +11,9 @@ Use sources in this order:
 1. The current checkout's public API and tests are authoritative.
 2. Local executable examples and migration/security documents explain intended behavior.
 3. The three external demo repositories show complete application architecture.
-4. README prose and generated Swagger files are supporting material; when they disagree with code, follow code.
+4. The external Spine CLI can scaffold projects and inspect explicit execution contracts, but its output is
+   separate evidence with the limits described below.
+5. README prose and generated Swagger files are supporting material; when they disagree with code, follow code.
 
 The external demos reviewed on 2026-07-30 all pin Spine `v0.5.1`. Their architecture is useful, but reconcile copied code with this checkout before using it. The public usage style remains compatible with `v0.5.2`; the newer checkout rejects malformed requests and invalid registrations earlier.
 
@@ -30,11 +32,96 @@ The linked demos intentionally pin the released `v0.5.1`; keep their pin when re
 | Goal | Reference | Start with |
 |---|---|---|
 | Learn the current minimal runtime and secure defaults | This repository | `cmd/demo`, `examples/security-config`, `test/app_integration_test.go` |
+| Scaffold a project, inspect execution contracts, or generate OpenAPI/AsyncAPI | [spine-cli](https://github.com/NARUBROWN/spine-cli/tree/a9fff677b385a59df65b0befcde6c410239a8c83) | `README.md`, `llms.txt`, `internal/cli/agent.go`, `internal/cli/contract.go` |
 | CRUD, Bun ORM, request transactions, and Swagger UI | [spine-user-demo](https://github.com/NARUBROWN/spine-user-demo/tree/b07d2bb35d6e0b499c6f6974e1d34f3a4fafffba) | `main.go`, `routes/user_routes.go`, `interceptor/tx_interceptor.go`, `repository/user_repository.go` |
 | Kafka request/event flow, idempotency, poison messages, and outbox boundaries | [spine-simple-msa-demo](https://github.com/NARUBROWN/spine-simple-msa-demo/tree/aa3f0fae8057ec0999fadaafc9295b7c7987afbb) | `order-app/main.go`, `stock-app/main.go`, `shared/events`, `scenarios/outbox` |
 | Authenticated WebSocket chat, rooms, and runtime limits | [spine-simple-chat-demo](https://github.com/NARUBROWN/spine-simple-chat-demo/tree/b1fe598329eb79828eb4c84903c7fa3847d35914) | `main.go`, `interceptor/auth_interceptor.go`, `controller/chat_controller.go`, `e2e/websocket_e2e_test.go` |
 
 `Bun ORM` means the Go ORM at `github.com/uptrace/bun`; it does not mean the Bun JavaScript runtime.
+
+## Spine CLI
+
+The separate [NARUBROWN/spine-cli](https://github.com/NARUBROWN/spine-cli) repository was reviewed at
+commit `a9fff677b385a59df65b0befcde6c410239a8c83` on 2026-08-03. Release `v0.1.4` requires Go 1.25.5.
+Installing the module root creates `spine-cli`; installing `cmd/spine` creates the shorter `spine` command:
+
+```sh
+go install github.com/NARUBROWN/spine-cli@v0.1.4
+spine-cli version
+
+# Or install the short command used in the examples below.
+go install github.com/NARUBROWN/spine-cli/cmd/spine@v0.1.4
+spine version
+```
+
+Both version commands print `spine-cli 0.1.4`. Projects created by this release pin Spine `v0.5.1`; they do
+not automatically use this checkout's untagged `v0.5.2` development source. When applying CLI output to
+another Spine version, inspect the generated `go.mod`, run the contract checks, and reconcile API changes
+against that exact Spine source.
+
+### What the CLI covers
+
+- `new` creates a project with `BuildApplication`, `app.Validate`, `GET /health`, and `spine.toml`.
+- `generate`/`g` creates resources, vertical slices, controllers, services, repositories, consumers, and
+  WebSockets and normally registers them in the composition root.
+- `inspect` and `explain` report a static-source contract for HTTP, DI, interceptors, consumers, WebSockets,
+  resources, and supported boot options.
+- `contract check`, snapshot/diff, and OpenAPI/AsyncAPI 3.1 export validate or materialize that static contract.
+- `verify` runs the static contract gate, gofmt status check, `go vet ./...`, and `go test ./...`.
+- `schema`, `capabilities`, and `context` provide versioned JSON intended for agents and automation.
+
+The generators intentionally do not design domain aggregates, ORM mappings, production persistence,
+transactions/outbox, broker retry/DLQ semantics, or WebSocket security/capacity policy. Kafka, RabbitMQ, and
+Bun-specific generators are not implemented in `v0.1.4`. A generated consumer or WebSocket handler returns an
+explicit `not implemented` error until application logic replaces it; contract validation should fail until
+then. The vertical slice's memory storage is development-only.
+
+### Agent-safe workflow
+
+Discover the installed CLI instead of relying on memorized flags, then inspect the target project without
+changing it:
+
+```sh
+spine schema --json
+spine capabilities --json
+spine context --root <project-directory> --json
+spine inspect --root <project-directory> --json
+```
+
+JSON-capable commands wrap success and failure in `spine.cli-result/v1`; read `ok`, `exit_code`, `result`, and
+any structured `error` even when the process exits non-zero. Treat `inspect` as observation, not a gate: check
+`analysis_complete` and diagnostics, and use `contract check` or `verify` for validation.
+
+For any generated change, use optimistic concurrency rather than immediately writing or forcing files:
+
+```sh
+spine g resource order --root <project-directory> --dry-run --json
+# Review result.changes, result.diff, and result.base_hash.
+spine g resource order --root <project-directory> --if-match <base_hash> --json
+spine contract check --root <project-directory> --warnings-as-errors --json
+spine verify --root <project-directory> --warnings-as-errors --json
+```
+
+The default is to refuse overwriting an existing target. Use `--force` only after reviewing a
+`--force --dry-run --json` plan. If `--if-match` reports a conflict, create and review a new plan instead of
+blindly retrying. `generate` also uses a project-level `.spine-generate.lock`; do not delete a lock without
+checking its type, owner, and age.
+
+### Evidence boundaries
+
+- `inspect`, `explain`, and `contract check` use static source analysis. Conditional, dynamic, helper-hidden,
+  or otherwise unresolved registration is reported with diagnostics and `analysis_complete: false`.
+- `verify` proves only the static contract plus local formatting, vet, and tests. It does not prove database,
+  broker, listener, deployment, or race-detector behavior.
+- `contract probe` executes project code through `BuildApplication`, runs `app.Validate`, and compares only
+  public consumer and WebSocket registries. It cannot reconcile HTTP routes, DI constructors, or interceptors,
+  and it can create temporary files, run Go tooling, resolve modules, or trigger composition-root side effects.
+- `doctor` is offline. External infrastructure readiness and deployed behavior require separate E2E evidence.
+
+Prefer direct and unconditional registrations in `BuildApplication() (spine.App, boot.Options, error)` so the
+CLI can analyze and update the composition root. For the complete command protocol, exit semantics, schemas,
+and current limitations, use the CLI repository's own
+[`llms.txt`](https://github.com/NARUBROWN/spine-cli/blob/a9fff677b385a59df65b0befcde6c410239a8c83/llms.txt).
 
 ## Repository map
 
