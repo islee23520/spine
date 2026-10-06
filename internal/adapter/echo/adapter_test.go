@@ -1,10 +1,14 @@
 package echo
 
 import (
+	"context"
 	"errors"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,6 +25,99 @@ import (
 
 type malformedJSONDTO struct {
 	Name string `json:"name"`
+}
+
+func TestServerListenerAddress_DefaultsEmptyAddressToHTTP(t *testing.T) {
+	server := NewServer(nil, "", nil, boot.HTTPOptions{})
+	if got := server.listenAddress(); got != ":http" {
+		t.Fatalf("empty listener address = %q, want %q", got, ":http")
+	}
+	server = NewServer(nil, "127.0.0.1:0", nil, boot.HTTPOptions{})
+	if got := server.listenAddress(); got != "127.0.0.1:0" {
+		t.Fatalf("explicit listener address = %q, want %q", got, "127.0.0.1:0")
+	}
+}
+
+func TestServerListenerReady_ServesBoundAddressAndCloses(t *testing.T) {
+	ready := make(chan net.Addr, 1)
+	var calls atomic.Int32
+	server := NewServer(nil, "127.0.0.1:0", nil, boot.HTTPOptions{
+		ListenerReady: func(address net.Addr) {
+			calls.Add(1)
+			ready <- address
+		},
+	})
+	server.echo.GET("/ready", func(c echo.Context) error {
+		c.Response().Header().Set("X-Listener-Proof", "owned")
+		return c.String(http.StatusOK, "listener ready")
+	})
+	done := make(chan error, 1)
+	go func() { done <- server.Start() }()
+	t.Cleanup(func() { _ = server.httpServer.Close() })
+	var address net.Addr
+	select {
+	case address = <-ready:
+	case err := <-done:
+		t.Fatalf("Start returned before readiness: %v", err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("listener readiness was not delivered")
+	}
+	client := &http.Client{Timeout: 3 * time.Second}
+	defer client.CloseIdleConnections()
+	response, err := client.Get("http://" + address.String() + "/ready")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if err != nil || response.StatusCode != http.StatusOK || string(body) != "listener ready" || response.Header.Get("X-Listener-Proof") != "owned" {
+		t.Fatalf("HTTP response: status=%d headers=%v body=%q error=%v", response.StatusCode, response.Header, body, err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, http.ErrServerClosed) {
+			t.Fatalf("Start terminal error = %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("Start did not terminate after Shutdown")
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("readiness calls = %d, want 1", calls.Load())
+	}
+	reused, err := net.Listen("tcp", address.String())
+	if err != nil {
+		t.Fatalf("listener remains open: %v", err)
+	}
+	if err := reused.Close(); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("listener proof: address=%s calls=%d HTTP=%d headers=%v body=%q Start=ErrServerClosed Shutdown=nil listener_closed=true", address, calls.Load(), response.StatusCode, response.Header, body)
+}
+
+func TestServerListenerReady_BindFailureDoesNotNotify(t *testing.T) {
+	owned, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owned.Close()
+	var calls atomic.Int32
+	server := NewServer(nil, owned.Addr().String(), nil, boot.HTTPOptions{
+		ListenerReady: func(net.Addr) { calls.Add(1) },
+	})
+	err = server.Start()
+	var bindError *net.OpError
+	if !errors.As(err, &bindError) || bindError.Op != "listen" {
+		t.Fatalf("Start error = %v, want listen error", err)
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("readiness calls after terminal bind failure = %d, want 0", calls.Load())
+	}
+	t.Logf("bind failure proof: address=%s calls=%d error=%v", owned.Addr(), calls.Load(), err)
 }
 
 type malformedJSONController struct{}

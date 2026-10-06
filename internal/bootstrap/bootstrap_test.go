@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,11 +18,16 @@ import (
 	"github.com/NARUBROWN/spine/internal/event/consumer"
 	spineRouter "github.com/NARUBROWN/spine/internal/router"
 	"github.com/NARUBROWN/spine/pkg/boot"
+	"github.com/NARUBROWN/spine/pkg/httpx"
 )
 
 type testController struct{}
 
 func (c *testController) Handle() string { return "ok" }
+
+func (c *testController) Ready() httpx.Response[string] {
+	return httpx.Response[string]{Body: "ok", Options: httpx.ResponseOptions{Headers: map[string]string{"X-Listener-Proof": "owned"}}}
+}
 
 type testTransport struct {
 	initErr    error
@@ -68,7 +75,7 @@ type missingWarmUpConsumer struct{}
 func (*missingWarmUpConsumer) Handle() {}
 
 type listenerFatalTransport struct {
-	address          string
+	ready            <-chan struct{}
 	fatalErr         error
 	listenerObserved atomic.Bool
 	stopCalls        atomic.Int32
@@ -77,17 +84,13 @@ type listenerFatalTransport struct {
 func (*listenerFatalTransport) Init(core.Container) error { return nil }
 
 func (t *listenerFatalTransport) Start() error {
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		conn, err := net.DialTimeout("tcp", t.address, 50*time.Millisecond)
-		if err == nil {
-			_ = conn.Close()
-			t.listenerObserved.Store(true)
-			return t.fatalErr
-		}
-		time.Sleep(10 * time.Millisecond)
+	select {
+	case <-t.ready:
+		t.listenerObserved.Store(true)
+		return t.fatalErr
+	case <-time.After(3 * time.Second):
+		return fmt.Errorf("HTTP listener readiness timeout: %w", t.fatalErr)
 	}
-	return fmt.Errorf("HTTP listener did not start before custom transport timeout: %w", t.fatalErr)
 }
 
 func (t *listenerFatalTransport) Stop(context.Context) error {
@@ -287,6 +290,7 @@ func TestValidate_RejectsInvalidRouteHandlers(t *testing.T) {
 }
 
 func TestRun_DoesNotExposeHTTPListenerBeforeConsumerWarmUpSucceeds(t *testing.T) {
+	var readinessCalls atomic.Int32
 	reserved, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("reserve HTTP address: %v", err)
@@ -309,7 +313,7 @@ func TestRun_DoesNotExposeHTTPListenerBeforeConsumerWarmUpSucceeds(t *testing.T)
 	go func() {
 		runDone <- Run(Config{
 			Address: address,
-			HTTP:    &boot.HTTPOptions{},
+			HTTP:    &boot.HTTPOptions{ListenerReady: func(net.Addr) { readinessCalls.Add(1) }},
 			Constructors: []any{func() *delayedFailConsumer {
 				close(warmUpStarted)
 				<-releaseWarmUp
@@ -326,16 +330,12 @@ func TestRun_DoesNotExposeHTTPListenerBeforeConsumerWarmUpSucceeds(t *testing.T)
 		close(releaseWarmUp)
 		t.Fatal("consumer warm-up did not start")
 	}
-	deadline := time.Now().Add(250 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		conn, dialErr := net.DialTimeout("tcp", address, 20*time.Millisecond)
-		if dialErr == nil {
-			_ = conn.Close()
-			close(releaseWarmUp)
-			<-runDone
-			t.Fatal("HTTP listener was exposed while consumer warm-up was incomplete")
-		}
-		time.Sleep(5 * time.Millisecond)
+	conn, dialErr := net.DialTimeout("tcp", address, time.Second)
+	if dialErr == nil {
+		_ = conn.Close()
+		close(releaseWarmUp)
+		<-runDone
+		t.Fatal("HTTP listener was exposed while consumer warm-up was incomplete")
 	}
 	close(releaseWarmUp)
 	select {
@@ -345,6 +345,9 @@ func TestRun_DoesNotExposeHTTPListenerBeforeConsumerWarmUpSucceeds(t *testing.T)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("Run did not return after consumer warm-up failure")
+	}
+	if readinessCalls.Load() != 0 {
+		t.Fatal("HTTP listener was exposed before consumer warm-up succeeded")
 	}
 }
 
@@ -433,10 +436,11 @@ func TestRun_CustomTransportFatalErrorShutsDownHTTPListener(t *testing.T) {
 	}
 
 	fatalErr := errors.New("custom transport fatal")
-	transport := &listenerFatalTransport{address: address, fatalErr: fatalErr}
+	ready := make(chan struct{})
+	transport := &listenerFatalTransport{ready: ready, fatalErr: fatalErr}
 	runErr := Run(Config{
 		Address:          address,
-		HTTP:             &boot.HTTPOptions{},
+		HTTP:             &boot.HTTPOptions{ListenerReady: func(net.Addr) { close(ready) }},
 		CustomTransports: []core.CustomTransport{transport},
 		ShutdownTimeout:  time.Second,
 	})
@@ -460,57 +464,102 @@ func TestRun_CustomTransportFatalErrorShutsDownHTTPListener(t *testing.T) {
 }
 
 func TestRunContext_CancellationShutsDownHTTPListener(t *testing.T) {
-	reserved, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("reserve HTTP address: %v", err)
-	}
-	address := reserved.Addr().String()
-	if err := reserved.Close(); err != nil {
-		t.Fatalf("release reserved HTTP address: %v", err)
-	}
-
+	ready := make(chan net.Addr, 1)
+	var calls atomic.Int32
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	runDone := make(chan error, 1)
 	go func() {
 		runDone <- RunContext(ctx, Config{
-			Address:                address,
-			HTTP:                   &boot.HTTPOptions{},
+			Address: "127.0.0.1:0",
+			HTTP: &boot.HTTPOptions{ListenerReady: func(address net.Addr) {
+				calls.Add(1)
+				ready <- address
+			}},
+			Constructors:           []any{func() *testController { return &testController{} }},
+			Routes:                 []spineRouter.RouteSpec{{Method: "GET", Path: "/ready", Handler: (*testController).Ready}},
 			EnableGracefulShutdown: true,
 			ShutdownTimeout:        time.Second,
 		})
 	}()
-
-	deadline := time.Now().Add(time.Second)
-	for {
-		conn, dialErr := net.DialTimeout("tcp", address, 20*time.Millisecond)
-		if dialErr == nil {
-			_ = conn.Close()
-			break
-		}
-		if time.Now().After(deadline) {
-			cancel()
-			t.Fatal("HTTP listener did not start")
-		}
-		time.Sleep(5 * time.Millisecond)
+	var address net.Addr
+	select {
+	case address = <-ready:
+	case err := <-runDone:
+		t.Fatalf("RunContext returned before readiness: %v", err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("HTTP listener readiness timeout")
 	}
-
+	client := &http.Client{Timeout: 3 * time.Second}
+	defer client.CloseIdleConnections()
+	response, err := client.Get("http://" + address.String() + "/ready")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if err != nil || response.StatusCode != http.StatusOK || string(body) != "ok" || response.Header.Get("X-Listener-Proof") != "owned" {
+		t.Fatalf("HTTP response: status=%d headers=%v body=%q error=%v", response.StatusCode, response.Header, body, err)
+	}
 	cancel()
 	select {
 	case err := <-runDone:
 		if err != nil {
 			t.Fatalf("RunContext returned an error after cancellation: %v", err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(3 * time.Second):
 		t.Fatal("RunContext did not return after cancellation")
 	}
-
-	reused, err := net.Listen("tcp", address)
+	if calls.Load() != 1 {
+		t.Fatalf("readiness calls = %d, want 1", calls.Load())
+	}
+	reused, err := net.Listen("tcp", address.String())
 	if err != nil {
-		t.Fatalf("HTTP address was not reusable after RunContext returned: %v", err)
+		t.Fatalf("HTTP address remains open: %v", err)
 	}
 	if err := reused.Close(); err != nil {
-		t.Fatalf("close reused HTTP listener: %v", err)
+		t.Fatal(err)
 	}
+	t.Logf("bootstrap proof: address=%s calls=%d HTTP=%d headers=%v body=%q RunContext=nil listener_closed=true", address, calls.Load(), response.StatusCode, response.Header, body)
+}
+
+func TestRunContext_CancellationAtListenerReadyClosesBeforeReturn(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ready := make(chan net.Addr, 1)
+	done := make(chan error, 1)
+	go func() {
+		done <- RunContext(ctx, Config{
+			Address: "127.0.0.1:0",
+			HTTP: &boot.HTTPOptions{ListenerReady: func(address net.Addr) {
+				ready <- address
+				cancel()
+			}},
+			ShutdownTimeout: time.Second,
+		})
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("RunContext did not complete cancellation at readiness")
+	}
+	var address net.Addr
+	select {
+	case address = <-ready:
+	default:
+		t.Fatal("RunContext returned without listener readiness")
+	}
+	reused, err := net.Listen("tcp", address.String())
+	if err != nil {
+		t.Fatalf("listener open after startup cancellation: %v", err)
+	}
+	if err := reused.Close(); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("startup cancellation proof: address=%s RunContext=nil listener_closed=true", address)
 }
 
 func TestWaitConsumerError_DrainsFatalErrorWhenDoneIsAlsoReady(t *testing.T) {

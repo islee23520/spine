@@ -2,6 +2,7 @@ package echo
 
 import (
 	"context"
+	"net"
 	"net/http"
 	"time"
 
@@ -37,6 +38,7 @@ type Server struct {
 	transportHooks []func(any)
 	httpServer     *http.Server
 	maxBodyBytes   int64
+	listenerReady  func(net.Addr)
 }
 
 func NewServer(pipeline *pipeline.Pipeline, address string, transportHooks []func(any), opts boot.HTTPOptions) *Server {
@@ -60,6 +62,7 @@ func NewServer(pipeline *pipeline.Pipeline, address string, transportHooks []fun
 		transportHooks: transportHooks,
 		httpServer:     httpServer,
 		maxBodyBytes:   normalized.MaxBodyBytes,
+		listenerReady:  opts.ListenerReady,
 	}
 }
 
@@ -132,7 +135,22 @@ func (s *Server) Mount() {
 }
 
 func (s *Server) Start() error {
-	return s.httpServer.ListenAndServe()
+	listener, err := net.Listen("tcp", s.listenAddress())
+	if err != nil {
+		return err
+	}
+	defer listener.Close()
+	if s.listenerReady != nil {
+		s.listenerReady(listener.Addr())
+	}
+	return s.httpServer.Serve(listener)
+}
+
+func (s *Server) listenAddress() string {
+	if s.address == "" {
+		return ":http"
+	}
+	return s.address
 }
 
 func (s *Server) handle(c echo.Context) error {
