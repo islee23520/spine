@@ -63,6 +63,12 @@ HTTP 런타임 설정입니다.
 HTTP 요청 실행 흐름에만 영향을 줍니다.
 */
 type HTTPOptions struct {
+	// ListenerReady is called once after a successful HTTP bind, with the actual
+	// listener address (including the assigned port when Address uses port zero).
+	// It is not called on bind failure. It runs synchronously before serving and
+	// must return promptly; it must not wait for an HTTP request or panic.
+	ListenerReady func(net.Addr)
+
 	// HTTP API 전역 접두사(예: "/api/v1")
 	// 빈 값이면 접두사를 적용하지 않습니다.
 	GlobalPrefix string

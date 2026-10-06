@@ -196,6 +196,7 @@ func RunContext(ctx context.Context, config Config) error {
 
 	var server *httpEngine.Server
 	var httpErrCh chan error
+	var httpDone chan struct{}
 	var consumerErrCh chan error
 	var customTransportErrCh chan error
 	var wsRuntime *ws.Runtime
@@ -234,6 +235,9 @@ func RunContext(ctx context.Context, config Config) error {
 					log.Printf("[Bootstrap] failed to shut down HTTP server: %v", err)
 				}
 				cancel()
+				if httpDone != nil {
+					<-httpDone
+				}
 			}
 
 			// Consumer Stop은 모든 worker/ACK/NACK/reader 종료가 끝날 때까지 대기하는 계약입니다.
@@ -577,7 +581,9 @@ func RunContext(ctx context.Context, config Config) error {
 	}
 	if server != nil {
 		log.Printf("[Bootstrap] Server listening on: %s", config.Address)
+		httpDone = make(chan struct{})
 		go func() {
+			defer close(httpDone)
 			if err := server.Start(); err != nil && err != http.ErrServerClosed {
 				httpErrCh <- err
 			}
